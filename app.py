@@ -165,3 +165,34 @@ if uploaded:
         st.success("Extraction complete")
         st.write("### Extracted Fields")
         st.json(fields)
+
+        # Natural language summary
+        if all(k in fields for k in ["amount_requested", "total_project_cost", "baseline_income_per_person", "post_income_per_person", "net_income_change", "people_impacted"]):
+            # Extract values
+            amount = fields['amount_requested']
+            total_cost = fields['total_project_cost']
+            baseline = fields['baseline_income_per_person']
+            post_income = fields['post_income_per_person']
+            net_change = fields['net_income_change']
+            impacted = fields['people_impacted']
+
+            # Calculate percentage and recommended impacted
+            percent = amount / total_cost * 100
+            recommended_imp = int(impacted * amount / total_cost)
+
+            # Build summary
+            summary = (
+                f"The grant request is for ${amount:,}, out of a total project cost of ${total_cost:,}. "
+                f"Each participant's baseline annual income is estimated at ${baseline:,}, which is projected to rise to ${post_income:,} per person. "
+                f"This represents a net annual income increase of ${net_change:,} per person, affecting {impacted:,} individuals overall."
+            )
+            # Add recommendation if funding is partial
+            if amount < total_cost:
+                summary += (
+                    f" Due to the funding making up {percent:.1f}% of the total project cost, "
+                    f"we recommend adjusting the number of people impacted to {recommended_imp:,} individuals."
+                )
+
+            st.write("### Summary")
+            st.write(summary)
+
