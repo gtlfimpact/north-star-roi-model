@@ -1,4 +1,5 @@
 import os
+import re
 import streamlit as st
 import pandas as pd
 import altair as alt
@@ -7,15 +8,23 @@ import PyPDF2
 import docx
 import json
 
-# Load OpenAI key
+# ─── Helpers ────────────────────────────────────────────────────────────────
+def parse_currency(val):
+    """Strip non-numeric (except dot) characters and convert to float."""
+    if isinstance(val, str):
+        nums = re.sub(r"[^\d.]", "", val)
+        return float(nums) if nums else 0.0
+    return float(val)
+
+# ─── OpenAI Client Setup ────────────────────────────────────────────────────
 api_key = os.getenv("OPENAI_API_KEY")
 if not api_key:
     st.error("OPENAI_API_KEY not set in environment")
     st.stop()
-client = OpenAI(api_key=api_key)
+client     = OpenAI(api_key=api_key)
 model_name = "gpt-4.1"
 
-# Brand colors
+# ─── Branding & Layout ──────────────────────────────────────────────────────
 BRAND = {
     "red":    "#E24329",
     "orange": "#FC6D26",
@@ -26,8 +35,6 @@ BRAND = {
 }
 
 st.set_page_config(page_title="PV Benefit–Cost Ratio", layout="wide")
-
-# Inject custom CSS for brand colors
 st.markdown(f"""
 <style>
   .reportview-container, .main {{ background-color: {BRAND['white']}; }}
@@ -36,7 +43,7 @@ st.markdown(f"""
 </style>
 """, unsafe_allow_html=True)
 
-# Sidebar inputs
+# ─── Sidebar Inputs ─────────────────────────────────────────────────────────
 sidebar = st.sidebar
 sidebar.header("Inputs & Assumptions")
 pre      = sidebar.number_input("Pre-income per person (USD)", value=0, format="%d")
@@ -57,7 +64,7 @@ with sidebar.expander("How PV is calculated", expanded=False):
 
 st.title("PV Benefit–Cost Ratio Calculator")
 
-# Calculation
+# ─── PV Calculation & Chart ──────────────────────────────────────────────────
 if run_calc:
     rate     = rate_pct / 100.0
     ann      = (post - pre) * imp
@@ -65,19 +72,19 @@ if run_calc:
     total_pv = ann * factor
     bcr      = total_pv / cost if cost > 0 else 0
 
-    col1, col2 = st.columns(2)
-    col1.metric("Total PV Income Increase", f"${total_pv:,.0f}")
-    col2.metric("Benefit–Cost Ratio", f"{bcr:.2f}")
+    c1, c2 = st.columns(2)
+    c1.metric("Total PV Income Increase", f"${total_pv:,.0f}")
+    c2.metric("Benefit–Cost Ratio",       f"{bcr:.2f}")
 
     years   = list(range(0, int(yrs) + 1))
-    pv_gain = [0.0] + [ann / ((1 + rate) ** t) for t in years[1:]]
-    pv_pre  = [0.0] + [(pre * imp) / ((1 + rate) ** t) for t in years[1:]]
-    pv_post = [0.0] + [(post * imp) / ((1 + rate) ** t) for t in years[1:]]
+    pv_gain = [0.0] + [ann      / ((1 + rate) ** t) for t in years[1:]]
+    pv_pre  = [0.0] + [(pre*imp)  / ((1 + rate) ** t) for t in years[1:]]
+    pv_post = [0.0] + [(post*imp) / ((1 + rate) ** t) for t in years[1:]]
 
     df = pd.DataFrame({
         "Cumulative Net PV Income Gains":           pd.Series(pv_gain).cumsum(),
         "Cumulative Counterfactual PV Income Gains": pd.Series(pv_pre).cumsum(),
-        "Cumulative Post PV Income Gains":          pd.Series(pv_post).cumsum(),
+        "Cumulative Post PV Income Gains":           pd.Series(pv_post).cumsum(),
     }, index=years)
     df.index.name = "Year"
 
@@ -88,27 +95,23 @@ if run_calc:
         value_name="Value"
     )
     color_scale = alt.Scale(
-        domain=[
-            "Cumulative Net PV Income Gains",
-            "Cumulative Counterfactual PV Income Gains",
-            "Cumulative Post PV Income Gains"
-        ],
+        domain=list(df.columns),
         range=[BRAND['red'], BRAND['black'], BRAND['orange']]
     )
     chart = (
         alt.Chart(df_melt)
-            .mark_line(point=True)
-            .encode(
-                x=alt.X("Year:O"),
-                y=alt.Y("Value:Q", title="PV ($)"),
-                color=alt.Color("Series:N", scale=color_scale, legend=alt.Legend(title="Series")),
-                tooltip=["Year", "Series", alt.Tooltip("Value", format="$,.2f")]
-            )
-            .properties(width="container", height=400)
+           .mark_line(point=True)
+           .encode(
+               x=alt.X("Year:O"),
+               y=alt.Y("Value:Q", title="PV ($)"),
+               color=alt.Color("Series:N", scale=color_scale),
+               tooltip=["Year", "Series", alt.Tooltip("Value", format="$,.2f")],
+           )
+           .properties(width="container", height=400)
     )
     st.altair_chart(chart, use_container_width=True)
 
-# Prompt template always visible
+# ─── Extraction Prompt ───────────────────────────────────────────────────────
 st.write("---")
 st.markdown("**Extraction prompt:**")
 prompt_template = """```text
@@ -123,37 +126,45 @@ Extract the following fields from this grant application:
 Return JSON with keys:
 amount_requested, total_project_cost,
 baseline_income_per_person, post_income_per_person,
-net_income_change, people_impacted.
+net_income_change, people_impacted
 ```"""
 st.code(prompt_template, language="text")
 
-# File upload & extraction
-uploaded = st.file_uploader("Upload PDF or DOCX to extract key fields", type=["pdf", "docx"])
+# ─── File Upload & GPT Extraction ──────────────────────────────────────────
+uploaded = st.file_uploader("Upload PDF or DOCX to extract key fields", type=["pdf","docx"])
 if uploaded:
     st.write(f"Uploaded file: {uploaded.name}")
     if st.button("Extract Fields"):
         with st.spinner("Extracting fields..."):
-            # Read text
+            # Read raw text
             if uploaded.type == "application/pdf":
                 reader = PyPDF2.PdfReader(uploaded)
                 text = "\n".join(page.extract_text() or "" for page in reader.pages)
             else:
-                doc = docx.Document(uploaded)
+                doc  = docx.Document(uploaded)
                 text = "\n".join(p.text for p in doc.paragraphs)
 
-            # Build prompt
+            # Build and send to GPT
             full_prompt = prompt_template.strip("```text\n```") + "\n\n" + text
-
             try:
-                response = client.chat.completions.create(
+                resp = client.chat.completions.create(
                     model=model_name,
                     messages=[
                         {"role": "system", "content": "Extract fields from grant."},
-                        {"role": "user",   "content": full_prompt},
+                        {"role": "user",   "content": full_prompt}
                     ],
-                    temperature=0,
+                    temperature=0
                 )
-                fields = json.loads(response.choices[0].message.content)
+                raw_fields = json.loads(resp.choices[0].message.content)
+                # Convert to proper types
+                fields = {
+                    "amount_requested":           parse_currency(raw_fields.get("amount_requested", 0)),
+                    "total_project_cost":         parse_currency(raw_fields.get("total_project_cost", 0)),
+                    "baseline_income_per_person": parse_currency(raw_fields.get("baseline_income_per_person", 0)),
+                    "post_income_per_person":     parse_currency(raw_fields.get("post_income_per_person", 0)),
+                    "net_income_change":          parse_currency(raw_fields.get("net_income_change", 0)),
+                    "people_impacted":            int(raw_fields.get("people_impacted", 0))
+                }
             except (OpenAIError, json.JSONDecodeError) as e:
                 st.error(f"Extraction failed: {e}")
                 fields = {}
@@ -163,24 +174,24 @@ if uploaded:
             st.json(fields)
 
             # Build natural summary
-            amt  = fields["amount_requested"]
-            tc   = fields["total_project_cost"]
-            bi   = fields["baseline_income_per_person"]
-            pi   = fields["post_income_per_person"]
-            nc   = fields["net_income_change"]
-            ppl  = fields["people_impacted"]
-            pct  = amt / tc * 100
-            recp = int(ppl * amt / tc)
+            a   = fields["amount_requested"]
+            tc  = fields["total_project_cost"]
+            bi  = fields["baseline_income_per_person"]
+            pi  = fields["post_income_per_person"]
+            nc  = fields["net_income_change"]
+            ppl = fields["people_impacted"]
+            pct = (a / tc * 100) if tc else 0
+            rec = int(ppl * a / tc)      if tc else 0
 
             summary_md = (
-                f"The grant request is for **${amt:,.0f}**, out of a total project cost of **${tc:,.0f}**. "
+                f"The grant request is for **${a:,.0f}**, out of a total project cost of **${tc:,.0f}**. "
                 f"Each participant’s baseline annual income is **${bi:,.0f}**, rising to **${pi:,.0f}**. "
                 f"This is a net annual increase of **${nc:,.0f}** per person, impacting **{ppl:,}** individuals overall."
             )
-            if amt < tc:
+            if a < tc:
                 summary_md += (
                     f" Due to funding covering **{pct:.1f}%** of total cost, "
-                    f"we recommend adjusting impacted to **{recp:,}** individuals."
+                    f"we recommend adjusting impacted to **{rec:,}** individuals."
                 )
 
             st.markdown("### Summary")
