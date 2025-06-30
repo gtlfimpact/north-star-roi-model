@@ -10,13 +10,37 @@ def calculate_bcr_pv(pre, post, imp, cost, yrs, r):
 
 st.title("PV Benefit–Cost Ratio Calculator")
 
-pre      = st.number_input("Pre-income per person (USD)",    value=0, format="$%d")
-post     = st.number_input("Post-income per person (USD)",   value=0, format="$%d")
-imp      = st.number_input("People impacted",                value=0, format="%d")
-cost     = st.number_input("Total program cost (USD)",       value=0, format="$%d")
-yrs      = st.number_input("Years of income increase",       value=1, format="%d")
-rate_pct = st.number_input("Discount rate (%)",              value=3.0, format="%.2f%%")
-rate     = rate_pct / 100.0
+pre      = st.number_input(
+    "Pre-income per person (USD)", 
+    value=0, 
+    format="%d"
+)
+post     = st.number_input(
+    "Post-income per person (USD)", 
+    value=0, 
+    format="%d"
+)
+imp      = st.number_input(
+    "People impacted", 
+    value=0, 
+    format="%d"
+)
+cost     = st.number_input(
+    "Total program cost (USD)", 
+    value=0, 
+    format="%d"
+)
+yrs      = st.number_input(
+    "Years of income increase", 
+    value=1, 
+    format="%d"
+)
+rate_pct = st.number_input(
+    "Discount rate (%)", 
+    value=3.0, 
+    format="%.2f"
+)
+rate = rate_pct / 100.0
 
 if st.button("Calculate"):
     if cost <= 0:
@@ -26,18 +50,17 @@ if st.button("Calculate"):
         st.write(f"**Total PV Income Increase:** ${total_pv:,.0f}")
         st.write(f"**PV Benefit–Cost Ratio:** {bcr:.2f}")
 
-        # Compute discounted cash flows and cumulative sums from year 0 to yrs
+        # build year-by-year series from t=0 to t=yrs
         cf_gain = (post - pre) * imp
         cf_pre  = pre * imp
         years   = list(range(0, int(yrs) + 1))
 
-        # Annual PV at t>0, zero at t=0
+        # PV at t=0 is zero
         pv_gain = [0.0] + [cf_gain / ((1 + rate) ** t) for t in years[1:]]
         pv_pre  = [0.0] + [cf_pre  / ((1 + rate) ** t) for t in years[1:]]
 
-        # Cumulative PV
-        cum_gain = pd.Series(pv_gain).cumsum().tolist()
-        cum_pre  = pd.Series(pv_pre).cumsum().tolist()
+        cum_gain = pd.Series(pv_gain).cumsum()
+        cum_pre  = pd.Series(pv_pre).cumsum()
 
         df = pd.DataFrame({
             "Cumulative Net PV Gain":           cum_gain,
