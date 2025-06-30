@@ -1,23 +1,29 @@
+import os
 from openai import OpenAI
 import streamlit as st
 import pandas as pd
 import altair as alt
 import PyPDF2
 import docx
-import openai
 import json
 
-# Configure OpenAI key 
-import os
-openai.api_key = os.getenv("OPENAI_API_KEY")
+# Load your key into a variable
+api_key = os.getenv("OPENAI_API_KEY")      
 client  = OpenAI(api_key=api_key)
 
-response = client.chat.completions.create(
-    model="gpt-4",
-    messages=[{"role":"system","content":"…"}, {"role":"user","content": prompt}],
-    temperature=0,
-)
-fields = response.choices[0].message.content
+# …rest of your code…
+
+if uploaded:
+    # build prompt…
+    response = client.chat.completions.create(
+        model="gpt-4",
+        messages=[
+            {"role":"system","content":"…"},
+            {"role":"user","content": prompt}
+        ],
+        temperature=0,
+    )
+    fields = response.choices[0].message.content
 
 # Brand colors
 BRAND = {
