@@ -1,7 +1,5 @@
 import streamlit as st
 
-import streamlit as st
-
 def calculate_bcr_pv(pre, post, imp, cost, yrs, r):
     ann        = (post - pre) * imp
     factor     = (1 - (1 + r) ** -yrs) / r if r > 0 else yrs
@@ -54,10 +52,3 @@ if st.button("Calculate"):
         bcr, total_pv = calculate_bcr_pv(pre, post, imp, cost, yrs, rate)
         st.write(f"**Total PV Income Increase:** ${total_pv:,.0f}")
         st.write(f"**PV Benefit–Cost Ratio:** {bcr:.2f}")
-
-
-
-
-!ls -l app.py
-from google.colab import files
-files.download('app.py')
