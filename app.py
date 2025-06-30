@@ -10,90 +10,59 @@ import json
 # Load OpenAI key
 api_key = os.getenv("OPENAI_API_KEY")
 if not api_key:
-    st.error("OPENAI_API_KEY not set")
+    st.error("OPENAI_API_KEY not set in environment")
     st.stop()
 client = OpenAI(api_key=api_key)
 model_name = "gpt-4.1"
 
-# Branding omitted for brevity...
+# Brand colors (omitted for brevity)...
 
-# Sidebar inputs (unchanged)…
+st.set_page_config(page_title="PV Benefit–Cost Ratio", layout="wide")
+
+# Sidebar inputs
 sidebar = st.sidebar
-# … your number_inputs …
-
+sidebar.header("Inputs & Assumptions")
+pre      = sidebar.number_input("Pre-income per person (USD)", value=0, format="%d")
+post     = sidebar.number_input("Post-income per person (USD)", value=0, format="%d")
+imp      = sidebar.number_input("People impacted", value=0, format="%d")
+cost     = sidebar.number_input("Total program cost (USD)", value=0, format="%d")
+yrs      = sidebar.number_input("Years of income increase", value=1, format="%d")
+rate_pct = sidebar.number_input("Discount rate (%)", value=3.0, format="%.2f")
 run_calc = sidebar.button("Calculate")
+
+with sidebar.expander("How PV is calculated", expanded=False):
+    st.write(
+        "1. Annual gain = (post - pre) × people impacted  \n"
+        "2. Discount factor = (1 - (1+r)^-yrs)/r  \n"
+        "3. PV benefit = annual gain × discount factor  \n"
+        "4. BCR = PV benefit / total cost"
+    )
+
+st.title("PV Benefit–Cost Ratio Calculator")
+
+# Calculation
 if run_calc:
-    # … calculation + chart …
+    rate     = rate_pct / 100.0
+    ann      = (post - pre) * imp
+    factor   = (1 - (1 + rate) ** -yrs) / rate if rate > 0 else yrs
+    total_pv = ann * factor
+    bcr      = total_pv / cost if cost > 0 else 0
 
-st.write("---")
-st.write("## Upload Grant Application")
-uploaded = st.file_uploader("Upload PDF or DOCX…", type=["pdf","docx"])
+    col1, col2 = st.columns(2)
+    col1.metric("Total PV Income Increase", f"${total_pv:,.0f}")
+    col2.metric("Benefit–Cost Ratio", f"{bcr:.2f}")
 
-# **Always show the prompt template** so it stays on-screen
-prompt_template = """```text
-Extract the following fields from this grant application:
-- Amount requested
-- Total project cost
-- Estimated baseline or counterfactual annual income per person
-- Post income per person
-- Net change in annual income per person
-- Number of people positively impacted
+    years   = list(range(0, int(yrs) + 1))
+    pv_gain = [0.0] + [ann / ((1 + rate) ** t) for t in years[1:]]
+    pv_pre  = [0.0] + [(pre * imp) / ((1 + rate) ** t) for t in years[1:]]
+    pv_post = [0.0] + [(post * imp) / ((1 + rate) ** t) for t in years[1:]]
 
-Return JSON with keys:
-amount_requested, total_project_cost,
-baseline_income_per_person, post_income_per_person,
-net_income_change, people_impacted.
-```"""
-st.markdown("**Extraction prompt:**")
-st.code(prompt_template, language="text")
+    df = pd.DataFrame({
+        "Cumulative Net PV Income Gains":           pd.Series(pv_gain).cumsum(),
+        "Cumulative Counterfactual PV Income Gains": pd.Series(pv_pre).cumsum(),
+        "Cumulative Post PV Income Gains":          pd.Series(pv_post).cumsum(),
+    }, index=years)
+    df.index.name = "Year"
 
-if uploaded:
-    st.write(f"Uploaded file: {uploaded.name}")
-    if st.button("Extract Fields"):
-        with st.spinner("Extracting…"):
-            # read text …
-            # build prompt (insert the actual document text after the template) …
-            full_prompt = prompt_template.strip("```text\n```") + "\n\n" + document_text
-
-            try:
-                resp = client.chat.completions.create(
-                    model=model_name,
-                    messages=[
-                      {"role":"system","content":"Extract fields from grant."},
-                      {"role":"user","content": full_prompt}
-                    ],
-                    temperature=0
-                )
-                content = resp.choices[0].message.content
-                fields = json.loads(content)
-            except (OpenAIError, json.JSONDecodeError) as e:
-                st.error(f"Extraction failed: {e}")
-                fields = {}
-
-        if fields:
-            st.success("Extraction complete")
-            st.json(fields)
-
-            # Natural‐language summary with **bold** numbers
-            amt = fields["amount_requested"]
-            tc  = fields["total_project_cost"]
-            bi  = fields["baseline_income_per_person"]
-            pi  = fields["post_income_per_person"]
-            nc  = fields["net_income_change"]
-            ppl = fields["people_impacted"]
-            pct = amt/tc*100
-            rec = int(ppl * amt/tc)
-
-            summary_md = (
-                f"The grant request is for **${amt:,.0f}**, out of a total project cost of **${tc:,.0f}**. "
-                f"Each participant’s baseline annual income is **${bi:,.0f}**, rising to **${pi:,.0f}**. "
-                f"This is a net annual increase of **${nc:,.0f}** per person, impacting **{ppl:,}** individuals. "
-            )
-            if amt < tc:
-                summary_md += (
-                  f"Due to funding covering **{pct:.1f}%** of total cost, "
-                  f"we recommend adjusting impacted to **{rec:,}** individuals."
-                )
-
-            st.markdown("### Summary")
-            st.markdown(summary_md)
+    st.write("### Cumulative PV Benefit Over Time")
+    df_melt = df.reset_index().melt(id_vars="Year", var_name
