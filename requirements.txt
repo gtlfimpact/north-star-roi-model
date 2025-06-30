@@ -1,1 +1,6 @@
 streamlit
+pandas
+altair
+PyPDF2
+python-docx
+openai
