@@ -146,16 +146,23 @@ if uploaded:
 
             # Build and send to GPT
             full_prompt = prompt_template.strip("```text\n```") + "\n\n" + text
+
             try:
                 resp = client.chat.completions.create(
                     model=model_name,
                     messages=[
                         {"role": "system", "content": "Extract fields from grant."},
-                        {"role": "user",   "content": full_prompt}
+                        {"role": "user",   "content": full_prompt},
                     ],
-                    temperature=0
+                    temperature=0,
                 )
-                raw_fields = json.loads(resp.choices[0].message.content)
+
+                # Safely extract JSON from the response
+                raw_text = resp.choices[0].message.content
+                match = re.search(r"\{[\s\S]*\}", raw_text)
+                json_str = match.group(0) if match else raw_text
+                raw_fields = json.loads(json_str)
+
                 # Convert to proper types
                 fields = {
                     "amount_requested":           parse_currency(raw_fields.get("amount_requested", 0)),
@@ -165,6 +172,7 @@ if uploaded:
                     "net_income_change":          parse_currency(raw_fields.get("net_income_change", 0)),
                     "people_impacted":            int(raw_fields.get("people_impacted", 0))
                 }
+
             except (OpenAIError, json.JSONDecodeError) as e:
                 st.error(f"Extraction failed: {e}")
                 fields = {}
