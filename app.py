@@ -56,10 +56,10 @@ run_calc = sidebar.button("Calculate")
 
 with sidebar.expander("How PV is calculated", expanded=False):
     st.write(
-        "1. Annual gain = (post - pre) × people impacted  \n"
-        "2. Discount factor = (1 - (1+r)^-yrs)/r  \n"
-        "3. PV benefit = annual gain × discount factor  \n"
-        "4. BCR = PV benefit / total cost"
+        """1. Annual gain = (post - pre) × people impacted
+2. Discount factor = (1 - (1+r)^-yrs)/r
+3. PV benefit = annual gain × discount factor
+4. BCR = PV benefit / total cost"""
     )
 
 st.title("PV Benefit–Cost Ratio Calculator")
@@ -74,17 +74,17 @@ if run_calc:
 
     c1, c2 = st.columns(2)
     c1.metric("Total PV Income Increase", f"${total_pv:,.0f}")
-    c2.metric("Benefit–Cost Ratio",       f"{bcr:.2f}")
+    c2.metric("Benefit–Cost Ratio", f"{bcr:.2f}")
 
-    years   = list(range(0, int(yrs) + 1))
-    pv_gain = [0.0] + [ann      / ((1 + rate) ** t) for t in years[1:]]
-    pv_pre  = [0.0] + [(pre*imp)  / ((1 + rate) ** t) for t in years[1:]]
-    pv_post = [0.0] + [(post*imp) / ((1 + rate) ** t) for t in years[1:]]
+    years   = list(range(yrs+1))
+    pv_gain = [0.0] + [ann/((1+rate)**t) for t in years[1:]]
+    pv_pre  = [0.0] + [(pre*imp)/((1+rate)**t) for t in years[1:]]
+    pv_post = [0.0] + [(post*imp)/((1+rate)**t) for t in years[1:]]
 
     df = pd.DataFrame({
-        "Cumulative Net PV Income Gains":           pd.Series(pv_gain).cumsum(),
+        "Cumulative Net PV Income Gains": pd.Series(pv_gain).cumsum(),
         "Cumulative Counterfactual PV Income Gains": pd.Series(pv_pre).cumsum(),
-        "Cumulative Post PV Income Gains":           pd.Series(pv_post).cumsum(),
+        "Cumulative Post PV Income Gains": pd.Series(pv_post).cumsum(),
     }, index=years)
     df.index.name = "Year"
 
@@ -111,53 +111,32 @@ if run_calc:
     )
     st.altair_chart(chart, use_container_width=True)
 
-# ─── Extraction Prompt ───────────────────────────────────────────────────────
-st.write("---")
-st.markdown("**Extraction prompt:**")
-prompt_template = """```text
-Extract the following fields from this grant application:
-- Amount requested
-- Total project cost
-- Estimated baseline or counterfactual annual income per person
-- Post income per person
-- Net change in annual income per person
-- Number of people positively impacted
-
-Return JSON with keys:
-amount_requested, total_project_cost,
-baseline_income_per_person, post_income_per_person,
-net_income_change, people_impacted
-```"""
-st.code(prompt_template, language="text")
-
 # ─── File Upload & GPT Extraction ──────────────────────────────────────────
-uploaded = st.file_uploader("Upload PDF or DOCX to extract key fields", type=["pdf","docx"])
+st.write("---")
+uploaded = st.file_uploader("Upload PDF or DOCX", type=["pdf","docx"])
 if uploaded:
     st.write(f"Uploaded file: {uploaded.name}")
     if st.button("Extract Fields"):
         with st.spinner("Extracting fields..."):
-            # Read raw text
+            text = ""
             if uploaded.type == "application/pdf":
                 reader = PyPDF2.PdfReader(uploaded)
-                text = "\n".join(page.extract_text() or "" for page in reader.pages)
+                for page in reader.pages:
+                    text += (page.extract_text() or "") + "\n"
             else:
-                doc  = docx.Document(uploaded)
-                text = "\n".join(p.text for p in doc.paragraphs)
-
-            # Build and send to GPT
-            full_prompt = prompt_template.strip("```text\n```") + "\n\n" + text
+                docx_doc = docx.Document(uploaded)
+                for p in docx_doc.paragraphs:
+                    text += p.text + "\n"
 
             try:
                 resp = client.chat.completions.create(
                     model=model_name,
                     messages=[
-                        {"role": "system", "content": "Extract fields from grant."},
-                        {"role": "user",   "content": full_prompt},
+                        {"role":"system","content":"Extract fields from grant."},
+                        {"role":"user","content":text}
                     ],
                     temperature=0,
                 )
-
-                # Safely extract JSON from the response
                 raw_text = resp.choices[0].message.content
                 match = re.search(r"\{[\s\S]*\}", raw_text)
                 json_str = match.group(0) if match else raw_text
@@ -176,9 +155,6 @@ if uploaded:
 
         if fields:
             st.success("Extraction complete")
-            st.json(fields)
-
-            # Build natural summary
             a   = fields["amount_requested"]
             tc  = fields["total_project_cost"]
             bi  = fields["baseline_income_per_person"]
@@ -186,9 +162,9 @@ if uploaded:
             nc  = fields["net_income_change"]
             ppl = fields["people_impacted"]
             pct = (a / tc * 100) if tc else 0
-            rec = int(ppl * a / tc)      if tc else 0
+            rec = int(ppl * a / tc)  if tc else 0
 
-           summary_md = (
+            summary_md = (
                 f"The grant request is for **${a:,.0f}**, out of a total project cost of **${tc:,.0f}**. "
                 f"Each participant’s baseline annual income is **${bi:,.0f}**, rising to **${pi:,.0f}**. "
                 f"This is a net annual increase of **${nc:,.0f}** per person, impacting **{ppl:,}** individuals overall."
