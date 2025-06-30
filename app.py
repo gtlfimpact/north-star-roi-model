@@ -18,14 +18,11 @@ st.set_page_config(page_title="PV Benefit–Cost Ratio", layout="wide")
 # Inject brand CSS
 st.markdown(f"""
 <style>
-    /* Page background */
-    .reportview-container, .main {{ background-color: {BRAND['white']}; }}
-    /* Sidebar styling */
-    .sidebar .sidebar-content {{ background-color: {BRAND['grey']}; }}
-    /* Metric card value color */
-    .stMetric > div > div > div:nth-child(2) {{ color: {BRAND['red']}; }}
+  .reportview-container, .main {{ background-color: {BRAND['white']}; }}
+  .sidebar .sidebar-content {{ background-color: {BRAND['grey']}; }}
+  .stMetric > div > div > div:nth-child(2) {{ color: {BRAND['red']}; }}
 </style>
-""" , unsafe_allow_html=True)
+""", unsafe_allow_html=True)
 
 # Sidebar for inputs and help
 t = st.sidebar
@@ -40,12 +37,9 @@ run_calc = t.button("Calculate")
 
 with st.sidebar.expander("How PV is calculated", expanded=False):
     st.write(
-        "1. Annual gain = (post - pre) × people impacted  \
-"
-        "2. Discount factor = (1 - (1+r)^-yrs)/r  \
-"
-        "3. PV benefit = annual gain × discount factor  \
-"
+        "1. Annual gain = (post - pre) × people impacted  \n"
+        "2. Discount factor = (1 - (1+r)^-yrs)/r  \n"
+        "3. PV benefit = annual gain × discount factor  \n"
         "4. BCR = PV benefit / total cost"
     )
 
@@ -53,13 +47,12 @@ st.title("PV Benefit–Cost Ratio Calculator")
 
 if run_calc:
     rate = rate_pct / 100.0
-    # Calculate BCR & PV
     ann = (post - pre) * imp
     factor = (1 - (1 + rate)**-yrs) / rate if rate > 0 else yrs
     total_pv = ann * factor
     bcr = total_pv / cost if cost > 0 else 0
 
-    # Display metrics
+    # KPI cards
     col1, col2 = st.columns(2)
     col1.metric("Total PV Income Increase", f"${total_pv:,.0f}")
     col2.metric("Benefit–Cost Ratio", f"{bcr:.2f}")
@@ -67,25 +60,33 @@ if run_calc:
     # Build cumulative PV series
     cf_gain = ann
     cf_pre = pre * imp
+    cf_post = post * imp
     years = list(range(0, int(yrs) + 1))
     pv_gain = [0.0] + [cf_gain / ((1 + rate) ** t) for t in years[1:]]
-    pv_pre = [0.0] + [cf_pre / ((1 + rate) ** t) for t in years[1:]]
+    pv_pre = [0.0] + [cf_pre   / ((1 + rate) ** t) for t in years[1:]]
+    pv_post = [0.0] + [cf_post / ((1 + rate) ** t) for t in years[1:]]
+
     cum_gain = pd.Series(pv_gain).cumsum()
     cum_pre = pd.Series(pv_pre).cumsum()
+    cum_post = pd.Series(pv_post).cumsum()
 
     df = pd.DataFrame({
-        "Cumulative Net PV Gain": cum_gain,
-        "Pre-counterfactual PV": cum_pre
+        "Cumulative Net PV Income Gains": cum_gain,
+        "Cumulative Counterfactual PV Income Gains": cum_pre,
+        "Cumulative Post PV Income Gains": cum_post
     }, index=years)
     df.index.name = "Year"
 
-    # Altair line chart with brand colors
     st.write("### Cumulative PV Benefit Over Time")
-    df_reset = df.reset_index().melt(id_vars="Year", value_vars=[
-        "Cumulative Net PV Gain", "Pre-counterfactual PV"
-    ], var_name="Type", value_name="Value")
-    color_scale = alt.Scale(domain=["Cumulative Net PV Gain", "Pre-counterfactual PV"],
-                            range=[BRAND['red'], BRAND['black']])
+    df_reset = df.reset_index().melt(id_vars="Year", var_name="Type", value_name="Value")
+    color_scale = alt.Scale(
+        domain=[
+            "Cumulative Net PV Income Gains",
+            "Cumulative Counterfactual PV Income Gains",
+            "Cumulative Post PV Income Gains"
+        ],
+        range=[BRAND['red'], BRAND['black'], BRAND['orange']]
+    )
     chart = (
         alt.Chart(df_reset)
             .mark_line(point=True)
