@@ -16,14 +16,6 @@ client = OpenAI(api_key=api_key)
 model_name = "gpt-4.1"
 
 # Brand colors (omitted for brevity)...
-BRAND = {
-    "red":    "#E24329",
-    "orange": "#FC6D26",
-    "yellow": "#FCA326",
-    "black":  "#000000",
-    "grey":   "#EDEDED",
-    "white":  "#FFFFFF"
-}
 
 st.set_page_config(page_title="PV Benefit–Cost Ratio", layout="wide")
 
