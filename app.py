@@ -58,7 +58,7 @@ with sidebar.expander("How PV is calculated", expanded=False):
 st.title("PV Benefit–Cost Ratio Calculator")
 
 # Calculation and visualization
-def calculate_and_render():
+if run_calc:
     rate = rate_pct / 100.0
     ann = (post - pre) * imp
     factor = (1 - (1 + rate)**-yrs) / rate if rate > 0 else yrs
@@ -113,9 +113,6 @@ def calculate_and_render():
     )
     st.altair_chart(chart, use_container_width=True)
 
-if run_calc:
-    calculate_and_render()
-
 # File upload & extraction
 st.write("---")
 st.write("## Upload Grant Application")
@@ -123,12 +120,44 @@ uploaded = st.file_uploader(
     "Upload PDF or Word file to extract key fields", type=["pdf", "docx"]
 )
 if uploaded:
-    text = ""
-    if uploaded.type == "application/pdf":
-        reader = PyPDF2.PdfReader(uploaded)
-        for page in reader.pages:
-            text += (page.extract_text() or "") + "\n"
-    else:
-        doc = docx.Document(uploaded)
-        for p in doc.paragraphs:
-            t
+    st.write(f"Uploaded file: {uploaded.name}")
+    extract_btn = st.button("Extract Fields")
+    if extract_btn:
+        with st.spinner("Extracting fields from document..."):
+            # Read text
+            if "pdf" in uploaded.type:
+                reader = PyPDF2.PdfReader(uploaded)
+                text = "".join(page.extract_text() or "" + "\n" for page in reader.pages)
+            else:
+                doc = docx.Document(uploaded)
+                text = "\n".join(p.text for p in doc.paragraphs)
+
+            # Build prompt
+            prompt = (
+                "Extract the following fields from this grant application text:\n"
+                "- Amount requested\n"
+                "- Total project cost\n"
+                "- Estimated baseline or counterfactual annual income per person\n"
+                "- Post income per person\n"
+                "- Net change in annual income per person\n"
+                "- Number of people positively impacted\n"
+                "Return JSON with keys: amount_requested, total_project_cost, baseline_income_per_person, post_income_per_person, net_income_change, people_impacted.\n"
+                f"Application text:\n{text}"
+            )
+            # Call OpenAI
+            response = client.chat.completions.create(
+                model="gpt-4",
+                messages=[
+                    {"role": "system", "content": "You extract structured fields from a grant application."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0
+            )
+            content = response.choices[0].message.content
+            try:
+                fields = json.loads(content)
+            except json.JSONDecodeError:
+                fields = {"error": "Invalid JSON", "raw": content}
+        st.success("Extraction complete")
+        st.write("### Extracted Fields")
+        st.json(fields)
