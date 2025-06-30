@@ -10,11 +10,13 @@ import json
 
 # ─── Helpers ────────────────────────────────────────────────────────────────
 def parse_currency(val):
-    """Strip non-numeric (except dot) characters and convert to float."""
-    if isinstance(val, str):
-        nums = re.sub(r"[^\d.]", "", val)
-        return float(nums) if nums else 0.0
-    return float(val)
+    try:
+        if isinstance(val, str):
+            nums = re.sub(r"[^\d.]", "", val)
+            return float(nums) if nums else 0.0
+        return float(val)
+    except (ValueError, TypeError):
+        return 0.0
 
 # ─── OpenAI Client Setup ────────────────────────────────────────────────────
 api_key = os.getenv("OPENAI_API_KEY")
@@ -125,78 +127,84 @@ prompt_template = (
     "net_income_change, people_impacted"
 )
 
-
 # ─── File Upload & GPT Extraction ──────────────────────────────────────────
 uploaded = st.file_uploader("Upload PDF or DOCX to extract key fields", type=["pdf","docx"])
 if uploaded:
     st.write(f"Uploaded file: {uploaded.name}")
     if st.button("Extract Fields"):
-        with st.spinner("Extracting fields..."):
-            # Read raw text
+        with st.spinner("Extracting fields…"):
+            # 1) Pull text from PDF or DOCX
             if uploaded.type == "application/pdf":
                 reader = PyPDF2.PdfReader(uploaded)
-                text = "\n".join(page.extract_text() or "" for page in reader.pages)
+                text = "\n".join(p.extract_text() or "" for p in reader.pages)
             else:
-                doc  = docx.Document(uploaded)
-                text = "\n".join(p.text for p in doc.paragraphs)
+                docx_doc = docx.Document(uploaded)
+                text = "\n".join(p.text for p in docx_doc.paragraphs)
 
-            # Build and send to GPT
+            # 2) Guard against empty text
+            if not text.strip():
+                st.error("No extractable text found in document.")
+                st.stop()
+
+            # 3) Send clean prompt + text to GPT
             full_prompt = prompt_template + "\n\n" + text
-
-            try:
-                resp = client.chat.completions.create(
-                    model=model_name,
-                    messages=[
-                        {"role": "system", "content": "Extract fields from grant."},
-                        {"role": "user",   "content": full_prompt},
-                    ],
-                    temperature=0,
-                )
-
-                # Safely extract JSON from the response
-                raw_text = resp.choices[0].message.content
-                match = re.search(r"\{[\s\S]*\}", raw_text)
-                json_str = match.group(0) if match else raw_text
-                raw_fields = json.loads(json_str)
-
-                # Convert to proper types
-                fields = {
-                    "amount_requested":           parse_currency(raw_fields.get("amount_requested", 0)),
-                    "total_project_cost":         parse_currency(raw_fields.get("total_project_cost", 0)),
-                    "baseline_income_per_person": parse_currency(raw_fields.get("baseline_income_per_person", 0)),
-                    "post_income_per_person":     parse_currency(raw_fields.get("post_income_per_person", 0)),
-                    "net_income_change":          parse_currency(raw_fields.get("net_income_change", 0)),
-                    "people_impacted":            int(raw_fields.get("people_impacted", 0))
-                }
-
-            except (OpenAIError, json.JSONDecodeError) as e:
-                st.error(f"Extraction failed: {e}")
-                fields = {}
-
-        if fields:
-            st.success("Extraction complete")
-            st.json(fields)
-
-            # Build natural summary
-            a   = fields["amount_requested"]
-            tc  = fields["total_project_cost"]
-            bi  = fields["baseline_income_per_person"]
-            pi  = fields["post_income_per_person"]
-            nc  = fields["net_income_change"]
-            ppl = fields["people_impacted"]
-            pct = (a / tc * 100) if tc else 0
-            rec = int(ppl * a / tc)      if tc else 0
-
-            summary_md = (
-                f"The grant request is for **${a:,.0f}**, out of a total project cost of **${tc:,.0f}**. "
-                f"Each participant’s baseline annual income is **${bi:,.0f}**, rising to **${pi:,.0f}**. "
-                f"This is a net annual increase of **${nc:,.0f}** per person, impacting **{ppl:,}** individuals overall."
+            resp = client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {"role":"system", "content":"Extract fields from grant."},
+                    {"role":"user",   "content": full_prompt}
+                ],
+                temperature=0
             )
-            if a < tc:
-                summary_md += (
-                    f" Due to funding covering **{pct:.1f}%** of total cost, "
-                    f"we recommend adjusting impacted to **{rec:,}** individuals."
-                )
 
-            st.markdown("### Summary")
-            st.markdown(summary_md)
+            # 4) Grab the raw output and isolate the JSON
+            raw_text = resp.choices[0].message.content.strip()
+            if not raw_text:
+                st.error("GPT returned an empty response.")
+                st.stop()
+            match   = re.search(r"\{[\s\S]*\}", raw_text)
+            json_str = match.group(0) if match else raw_text
+
+            # 5) Parse JSON safely
+            try:
+                raw_fields = json.loads(json_str)
+            except json.JSONDecodeError:
+                st.error("Failed to parse JSON from GPT. Output was:")
+                st.code(raw_text)
+                st.stop()
+
+            # 6) Convert to proper types
+            fields = {
+                "amount_requested":           parse_currency(raw_fields.get("amount_requested", 0)),
+                "total_project_cost":         parse_currency(raw_fields.get("total_project_cost", 0)),
+                "baseline_income_per_person": parse_currency(raw_fields.get("baseline_income_per_person", 0)),
+                "post_income_per_person":     parse_currency(raw_fields.get("post_income_per_person", 0)),
+                "net_income_change":          parse_currency(raw_fields.get("net_income_change", 0)),
+                "people_impacted":            int(raw_fields.get("people_impacted", 0))
+            }
+
+        # 7) Display results & summary
+        st.success("Extraction complete")
+        st.json(fields)
+
+        a   = fields["amount_requested"]
+        tc  = fields["total_project_cost"]
+        bi  = fields["baseline_income_per_person"]
+        pi  = fields["post_income_per_person"]
+        nc  = fields["net_income_change"]
+        ppl = fields["people_impacted"]
+        pct = (a / tc * 100) if tc else 0
+        rec = int(ppl * a / tc)      if tc else 0
+
+        summary_md = (
+            f"The grant request is for **${a:,.0f}**, out of a total project cost of **${tc:,.0f}**. "
+            f"Each participant’s baseline annual income is **${bi:,.0f}**, rising to **${pi:,.0f}**. "
+            f"This is a net annual increase of **${nc:,.0f}** per person, impacting **{ppl:,}** individuals overall."
+        )
+        if a < tc:
+            summary_md += (
+                f" Due to funding covering **{pct:.1f}%** of total cost, "
+                f"we recommend adjusting impacted to **{rec:,}** individuals."
+            )
+        st.markdown("### Summary")
+        st.markdown(summary_md)
