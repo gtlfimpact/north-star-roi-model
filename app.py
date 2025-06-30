@@ -13,10 +13,7 @@ if not api_key:
     st.error("OPENAI_API_KEY not found in environment")
     st.stop()
 client = OpenAI(api_key=api_key)
-
-# Fixed model
 model_name = "gpt-4.1"
-
 
 # Brand colors
 BRAND = {
@@ -61,7 +58,7 @@ with sidebar.expander("How PV is calculated", expanded=False):
 
 st.title("PV Benefit–Cost Ratio Calculator")
 
-# Perform calculation
+# Calculation and visualization function
 def calculate_and_render():
     rate = rate_pct / 100.0
     ann = (post - pre) * imp
@@ -69,20 +66,22 @@ def calculate_and_render():
     total_pv = ann * factor
     bcr = total_pv / cost if cost > 0 else 0
 
-    # KPIs
-t1, t2 = st.columns(2)
-    t1.metric("Total PV Income Increase", f"${total_pv:,.0f}")
-    t2.metric("Benefit–Cost Ratio", f"{bcr:.2f}")
+    # Display KPIs
+    col1, col2 = st.columns(2)
+    col1.metric("Total PV Income Increase", f"${total_pv:,.0f}")
+    col2.metric("Benefit–Cost Ratio", f"{bcr:.2f}")
 
-    # Cumulative PV series
-    cf_gain, cf_pre, cf_post = ann, pre * imp, post * imp
+    # Build cumulative PV series
+    cf_gain = ann
+    cf_pre = pre * imp
+    cf_post = post * imp
     years = list(range(0, int(yrs) + 1))
     pv_gain = [0.0] + [cf_gain / ((1 + rate) ** t) for t in years[1:]]
-    pv_pre  = [0.0] + [cf_pre  / ((1 + rate) ** t) for t in years[1:]]
+    pv_pre = [0.0] + [cf_pre / ((1 + rate) ** t) for t in years[1:]]
     pv_post = [0.0] + [cf_post / ((1 + rate) ** t) for t in years[1:]]
 
     cum_gain = pd.Series(pv_gain).cumsum()
-    cum_pre  = pd.Series(pv_pre).cumsum()
+    cum_pre = pd.Series(pv_pre).cumsum()
     cum_post = pd.Series(pv_post).cumsum()
 
     df = pd.DataFrame({
@@ -121,7 +120,7 @@ if run_calc:
 # File upload & extraction
 st.write("---")
 st.write("## Upload Grant Application")
-uploaded = st.file_uploader("Upload PDF or DOCX to extract","type":["pdf","docx"])
+uploaded = st.file_uploader("Upload PDF or DOCX to extract key fields", type=["pdf","docx"])
 if uploaded:
     st.write(f"Uploaded file: {uploaded.name}")
     if st.button("Extract Fields"):
@@ -136,7 +135,15 @@ if uploaded:
 
             # Build prompt
             prompt = (
-                "Extract the following fields..."  # truncated for brevity
+                "Extract the following fields from this grant application:\n"
+                "- Amount requested\n"
+                "- Total project cost\n"
+                "- Estimated baseline or counterfactual annual income per person\n"
+                "- Post income per person\n"
+                "- Net change in annual income per person\n"
+                "- Number of people positively impacted\n"
+                "Return JSON with keys: amount_requested, total_project_cost, baseline_income_per_person, post_income_per_person, net_income_change, people_impacted.\n"
+                f"Application text:\n{text}"
             )
             try:
                 response = client.chat.completions.create(
