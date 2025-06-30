@@ -2,15 +2,30 @@ import streamlit as st
 import pandas as pd
 import altair as alt
 
-# Page config for wide layout
+# Brand colors
+BRAND = {
+    "red": "#E24329",
+    "orange": "#FC6D26",
+    "yellow": "#FCA326",
+    "black": "#000000",
+    "grey": "#EDEDED",
+    "white": "#FFFFFF"
+}
+
+# Page config
 st.set_page_config(page_title="PV Benefit–Cost Ratio", layout="wide")
 
-def calculate_bcr_pv(pre, post, imp, cost, yrs, r):
-    ann        = (post - pre) * imp
-    factor     = (1 - (1 + r)**-yrs) / r if r > 0 else yrs
-    pv_benefit = ann * factor
-    ratio      = pv_benefit / cost
-    return ratio, pv_benefit
+# Inject brand CSS
+st.markdown(f"""
+<style>
+    /* Page background */
+    .reportview-container, .main {{ background-color: {BRAND['white']}; }}
+    /* Sidebar styling */
+    .sidebar .sidebar-content {{ background-color: {BRAND['grey']}; }}
+    /* Metric card value color */
+    .stMetric > div > div > div:nth-child(2) {{ color: {BRAND['red']}; }}
+</style>
+""" , unsafe_allow_html=True)
 
 # Sidebar for inputs and help
 t = st.sidebar
@@ -26,24 +41,31 @@ run_calc = t.button("Calculate")
 with st.sidebar.expander("How PV is calculated", expanded=False):
     st.write(
         "1. Annual gain = (post - pre) × people impacted  \
-"        "2. Discount factor = (1 - (1+r)^-yrs)/r  \
-"        "3. PV benefit = annual gain × discount factor  \
-"        "4. BCR = PV benefit / total cost"
+"
+        "2. Discount factor = (1 - (1+r)^-yrs)/r  \
+"
+        "3. PV benefit = annual gain × discount factor  \
+"
+        "4. BCR = PV benefit / total cost"
     )
 
 st.title("PV Benefit–Cost Ratio Calculator")
 
 if run_calc:
     rate = rate_pct / 100.0
-    bcr, total_pv = calculate_bcr_pv(pre, post, imp, cost, yrs, rate)
+    # Calculate BCR & PV
+    ann = (post - pre) * imp
+    factor = (1 - (1 + rate)**-yrs) / rate if rate > 0 else yrs
+    total_pv = ann * factor
+    bcr = total_pv / cost if cost > 0 else 0
 
-    # Metrics cards
-    m1, m2 = st.columns(2)
-    m1.metric("Total PV Income Increase", f"${total_pv:,.0f}")
-    m2.metric("Benefit–Cost Ratio", f"{bcr:.2f}")
+    # Display metrics
+    col1, col2 = st.columns(2)
+    col1.metric("Total PV Income Increase", f"${total_pv:,.0f}")
+    col2.metric("Benefit–Cost Ratio", f"{bcr:.2f}")
 
     # Build cumulative PV series
-    cf_gain = (post - pre) * imp
+    cf_gain = ann
     cf_pre = pre * imp
     years = list(range(0, int(yrs) + 1))
     pv_gain = [0.0] + [cf_gain / ((1 + rate) ** t) for t in years[1:]]
@@ -53,24 +75,26 @@ if run_calc:
 
     df = pd.DataFrame({
         "Cumulative Net PV Gain": cum_gain,
-        "Cumulative Pre-counterfactual PV": cum_pre
+        "Pre-counterfactual PV": cum_pre
     }, index=years)
     df.index.name = "Year"
 
-    # Altair line chart with tooltips
+    # Altair line chart with brand colors
     st.write("### Cumulative PV Benefit Over Time")
     df_reset = df.reset_index().melt(id_vars="Year", value_vars=[
-        "Cumulative Net PV Gain", "Cumulative Pre-counterfactual PV"
+        "Cumulative Net PV Gain", "Pre-counterfactual PV"
     ], var_name="Type", value_name="Value")
+    color_scale = alt.Scale(domain=["Cumulative Net PV Gain", "Pre-counterfactual PV"],
+                            range=[BRAND['red'], BRAND['black']])
     chart = (
         alt.Chart(df_reset)
-        .mark_line(point=True)
-        .encode(
-            x="Year:O",
-            y=alt.Y("Value:Q", title="PV ($)"),
-            color="Type:N",
-            tooltip=["Year", "Type", alt.Tooltip("Value", format="$,.2f")]
-        )
-        .properties(width="container", height=400)
+            .mark_line(point=True)
+            .encode(
+                x=alt.X("Year:O"),
+                y=alt.Y("Value:Q", title="PV ($)"),
+                color=alt.Color("Type:N", scale=color_scale, legend=alt.Legend(title="Series")),
+                tooltip=["Year", "Type", alt.Tooltip("Value", format="$,.2f")]
+            )
+            .properties(width="container", height=400)
     )
     st.altair_chart(chart, use_container_width=True)
