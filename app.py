@@ -9,8 +9,8 @@ import docx
 import json
 
 # ─── Helpers ────────────────────────────────────────────────────────────────
+# Helper to parse currency strings
 def parse_currency(val):
-    """Strip non-numeric (except dot) characters and convert to float."""
     if isinstance(val, str):
         nums = re.sub(r"[^\d.]", "", val)
         return float(nums) if nums else 0.0
@@ -162,8 +162,6 @@ if uploaded:
                 match = re.search(r"\{[\s\S]*\}", raw_text)
                 json_str = match.group(0) if match else raw_text
                 raw_fields = json.loads(json_str)
-
-                # Convert to proper types
                 fields = {
                     "amount_requested":           parse_currency(raw_fields.get("amount_requested", 0)),
                     "total_project_cost":         parse_currency(raw_fields.get("total_project_cost", 0)),
@@ -172,8 +170,7 @@ if uploaded:
                     "net_income_change":          parse_currency(raw_fields.get("net_income_change", 0)),
                     "people_impacted":            int(raw_fields.get("people_impacted", 0))
                 }
-
-            except (OpenAIError, json.JSONDecodeError) as e:
+            except Exception as e:
                 st.error(f"Extraction failed: {e}")
                 fields = {}
 
@@ -191,7 +188,7 @@ if uploaded:
             pct = (a / tc * 100) if tc else 0
             rec = int(ppl * a / tc)      if tc else 0
 
-            summary_md = (
+           summary_md = (
                 f"The grant request is for **${a:,.0f}**, out of a total project cost of **${tc:,.0f}**. "
                 f"Each participant’s baseline annual income is **${bi:,.0f}**, rising to **${pi:,.0f}**. "
                 f"This is a net annual increase of **${nc:,.0f}** per person, impacting **{ppl:,}** individuals overall."
@@ -201,6 +198,5 @@ if uploaded:
                     f" Due to funding covering **{pct:.1f}%** of total cost, "
                     f"we recommend adjusting impacted to **{rec:,}** individuals."
                 )
-
             st.markdown("### Summary")
             st.markdown(summary_md)
