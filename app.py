@@ -197,17 +197,17 @@ if uploaded:
         rec = int(ppl * a / tc)      if tc else 0
 
         summary_html = (
-    f"<p>The grant request is for <strong>${a:,.0f}</strong>, out of a total project cost of "
-    f"<strong>${tc:,.0f}</strong>. Each participant’s baseline annual income is "
-    f"<strong>${bi:,.0f}</strong>, rising to <strong>${pi:,.0f}</strong>. "
-    f"This is a net annual increase of <strong>${nc:,.0f}</strong> per person, impacting "
-    f"<strong>{ppl:,}</strong> individuals overall.</p>"
-)
-if a < tc:
-    summary_html += (
-        f"<p>Due to funding covering <strong>{pct:.1f}%</strong> of total cost, "
-        f"we recommend adjusting impacted to <strong>{rec:,}</strong> individuals.</p>"
-    )
+            f"<p>The grant request is for <strong>${a:,.0f}</strong>, out of a total project cost of "
+            f"<strong>${tc:,.0f}</strong>. Each participant’s baseline annual income is "
+            f"<strong>${bi:,.0f}</strong>, rising to <strong>${pi:,.0f}</strong>. "
+            f"This is a net annual increase of <strong>${nc:,.0f}</strong> per person, impacting "
+            f"<strong>{ppl:,}</strong> individuals overall.</p>"
+        )
+        if a < tc:
+            summary_html += (
+            f"<p>Due to funding covering <strong>{pct:.1f}%</strong> of total cost, "
+            f"we recommend adjusting impacted to <strong>{rec:,}</strong> individuals.</p>"
+        )
 
-st.markdown("### Summary")
-st.markdown(summary_html, unsafe_allow_html=True)
+        st.markdown("### Summary")
+        st.markdown(summary_html, unsafe_allow_html=True)
