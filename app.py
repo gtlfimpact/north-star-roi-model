@@ -8,7 +8,6 @@ import PyPDF2
 import docx
 import json
 
-# ─── Helpers ────────────────────────────────────────────────────────────────
 # Helper to parse currency strings
 def parse_currency(val):
     if isinstance(val, str):
@@ -16,7 +15,7 @@ def parse_currency(val):
         return float(nums) if nums else 0.0
     return float(val)
 
-# ─── OpenAI Client Setup ────────────────────────────────────────────────────
+# OpenAI setup
 api_key = os.getenv("OPENAI_API_KEY")
 if not api_key:
     st.error("OPENAI_API_KEY not set in environment")
@@ -24,7 +23,7 @@ if not api_key:
 client     = OpenAI(api_key=api_key)
 model_name = "gpt-4.1"
 
-# ─── Branding & Layout ──────────────────────────────────────────────────────
+# Branding & Layout
 BRAND = {
     "red":    "#E24329",
     "orange": "#FC6D26",
@@ -43,7 +42,7 @@ st.markdown(f"""
 </style>
 """, unsafe_allow_html=True)
 
-# ─── Sidebar Inputs ─────────────────────────────────────────────────────────
+# Sidebar Inputs
 sidebar = st.sidebar
 sidebar.header("Inputs & Assumptions")
 pre      = sidebar.number_input("Pre-income per person (USD)", value=0, format="%d")
@@ -55,16 +54,16 @@ rate_pct = sidebar.number_input("Discount rate (%)", value=3.0, format="%.2f")
 run_calc = sidebar.button("Calculate")
 
 with sidebar.expander("How PV is calculated", expanded=False):
-    st.write(
-        """1. Annual gain = (post - pre) × people impacted
+    st.write("""
+1. Annual gain = (post - pre) × people impacted
 2. Discount factor = (1 - (1+r)^-yrs)/r
 3. PV benefit = annual gain × discount factor
-4. BCR = PV benefit / total cost"""
-    )
+4. BCR = PV benefit / total cost
+""")
 
 st.title("PV Benefit–Cost Ratio Calculator")
 
-# ─── PV Calculation & Chart ──────────────────────────────────────────────────
+# PV Calculation & Chart
 if run_calc:
     rate     = rate_pct / 100.0
     ann      = (post - pre) * imp
@@ -74,17 +73,17 @@ if run_calc:
 
     c1, c2 = st.columns(2)
     c1.metric("Total PV Income Increase", f"${total_pv:,.0f}")
-    c2.metric("Benefit–Cost Ratio", f"{bcr:.2f}")
+    c2.metric("Benefit–Cost Ratio",       f"{bcr:.2f}")
 
-    years   = list(range(yrs+1))
+    years   = list(range(yrs + 1))
     pv_gain = [0.0] + [ann/((1+rate)**t) for t in years[1:]]
     pv_pre  = [0.0] + [(pre*imp)/((1+rate)**t) for t in years[1:]]
     pv_post = [0.0] + [(post*imp)/((1+rate)**t) for t in years[1:]]
 
     df = pd.DataFrame({
-        "Cumulative Net PV Income Gains": pd.Series(pv_gain).cumsum(),
+        "Cumulative Net PV Income Gains":           pd.Series(pv_gain).cumsum(),
         "Cumulative Counterfactual PV Income Gains": pd.Series(pv_pre).cumsum(),
-        "Cumulative Post PV Income Gains": pd.Series(pv_post).cumsum(),
+        "Cumulative Post PV Income Gains":           pd.Series(pv_post).cumsum(),
     }, index=years)
     df.index.name = "Year"
 
@@ -111,9 +110,9 @@ if run_calc:
     )
     st.altair_chart(chart, use_container_width=True)
 
-# ─── File Upload & GPT Extraction ──────────────────────────────────────────
+# File Upload & GPT Extraction
 st.write("---")
-uploaded = st.file_uploader("Upload PDF or DOCX", type=["pdf","docx"])
+uploaded = st.file_uploader("Upload PDF or DOCX to extract key fields", type=["pdf","docx"])
 if uploaded:
     st.write(f"Uploaded file: {uploaded.name}")
     if st.button("Extract Fields"):
@@ -135,7 +134,7 @@ if uploaded:
                         {"role":"system","content":"Extract fields from grant."},
                         {"role":"user","content":text}
                     ],
-                    temperature=0,
+                    temperature=0
                 )
                 raw_text = resp.choices[0].message.content
                 match = re.search(r"\{[\s\S]*\}", raw_text)
