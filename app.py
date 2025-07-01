@@ -211,3 +211,41 @@ if uploaded:
 
         st.markdown("### Summary")
         st.markdown(summary_html, unsafe_allow_html=True)
+
+# ─── Synthetic Counterfactual Estimate ─────────────────────────────────
+        st.write("---")
+        st.header("Synthetic Counterfactual Estimate")
+
+        # Build the economist prompt
+        econ_prompt = (
+            "You are an expert economist.  Using only the information in the uploaded application text below, "
+            "determine the synthetic counterfactual annual income participants would likely earn had they NOT "
+            "joined this program or service.  Look for any mention of gender, ethnicity, age, demographics, "
+            "household income, poverty, and especially educational attainment.  Based on those factors, consult "
+            "typical datasets such as BLS, NCES, ACS, etc., to estimate a baseline/counterfactual annual income "
+            "for the average participant.  Return a JSON object with two keys:\n"
+            "  • counterfactual_income  (a number)\n"
+            "  • reasoning  (a short explanation with your data sources)\n\n"
+            "=== APPLICATION TEXT ===\n"
+            + text   # reuse the full text you already extracted above
+        )
+
+        # Call OpenAI again
+        econ_resp = client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {"role": "system", "content": "You estimate economic counterfactuals."},
+                {"role": "user",   "content": econ_prompt},
+            ],
+            temperature=0.2,
+        )
+
+        econ_output = econ_resp.choices[0].message.content.strip()
+        # Try to parse as JSON for nice display
+        try:
+            econ_data = json.loads(re.search(r"\{[\s\S]*\}", econ_output).group(0))
+            st.json(econ_data)
+            st.markdown("**Explanation:**  " + econ_data.get("reasoning", econ_output))
+        except Exception:
+            # fallback to raw text
+            st.markdown(econ_output)
