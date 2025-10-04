@@ -1,8 +1,8 @@
-# app.py — ROI Workbench (Lite, with AI rationales)
+# app.py — ROI Workbench (Lite, with AI rationales + Tornado input ranges + MC %>=100x)
 # - Uses Streamlit secret OPENAI_API_KEY (owner key)
 # - AI prefill returns values + rationales; computes gitlab_share_pct if needed
 # - Constant annual uplift PV (no half-life, attribution, deadweight)
-# - Sliders, Tornado, Monte Carlo, HTML one-pager
+# - Sliders, Tornado (shows input + BCR ranges), Monte Carlo (adds %>=100x), HTML one-pager
 
 import os, json, base64, datetime
 import streamlit as st
@@ -299,41 +299,88 @@ st.altair_chart(chart, use_container_width=True)
 
 st.divider()
 
-# ---------------------- Tornado -------------------
+# ---------------------- Tornado (shows input + BCR ranges) -------------------
 st.subheader("One-way Sensitivity (Tornado)")
 rng = st.slider("± Range", 0.05, 0.5, 0.2, 0.05)
 
 def run_tornado(p, var, low, high):
     pl = p.copy(); ph = p.copy()
     pl[var] = low; ph[var] = high
-    return compute_roi(pl)["bcr"], compute_roi(ph)["bcr"]
+    return (compute_roi(pl)["bcr"], compute_roi(ph)["bcr"])
+
+# variable specs with bounds for inputs
+specs = [
+    ("gitlab_share_pct", 0.0, 1.0, "pct"),
+    ("completion_rate", 0.0, 1.0, "pct"),
+    ("positive_outcome_rate", 0.0, 1.0, "pct"),
+    ("baseline_income", 0.0, None, "usd"),
+    ("post_income", 0.0, None, "usd"),
+    ("duration_years", 1.0, 40.0, "int"),
+    ("discount_rate", 0.0, 0.2, "pct"),
+    ("overhead_rate", 0.0, 0.5, "pct"),
+]
 
 rows = []
-specs = [
-    ("gitlab_share_pct", 0.0, 1.0),
-    ("completion_rate", 0.0, 1.0),
-    ("positive_outcome_rate", 0.0, 1.0),
-    ("baseline_income", 0.0, None),
-    ("post_income", 0.0, None),
-    ("duration_years", 1.0, 40.0),
-    ("discount_rate", 0.0, 0.2),
-    ("overhead_rate", 0.0, 0.5),
-]
-for var, lo_b, hi_b in specs:
+for var, lo_b, hi_b, kind in specs:
     baseline_val = params[var]
-    lo = max(baseline_val * (1 - rng), lo_b if lo_b is not None else -1e18)
-    hi = min(baseline_val * (1 + rng), hi_b if hi_b is not None else 1e18)
-    l, h = run_tornado(params, var, lo, hi)
-    rows.append({"Variable": var, "Low": min(l, h), "High": max(l, h), "Delta": abs(h - l)})
-tdf = pd.DataFrame(rows).sort_values("Delta", ascending=False)
+    lo_in = max(baseline_val * (1 - rng), lo_b if lo_b is not None else -1e18)
+    hi_in = min(baseline_val * (1 + rng), hi_b if hi_b is not None else 1e18)
+
+    # cast bounds for ints
+    if kind == "int":
+        lo_in = int(round(lo_in)); hi_in = int(round(hi_in))
+
+    bcr_lo, bcr_hi = run_tornado(params, var, lo_in, hi_in)
+    lo_bcr, hi_bcr = (min(bcr_lo, bcr_hi), max(bcr_lo, bcr_hi))
+
+    rows.append({
+        "Variable": var,
+        "Input Low": lo_in,
+        "Input High": hi_in,
+        "BCR Low": lo_bcr,
+        "BCR High": hi_bcr,
+        "Delta BCR": hi_bcr - lo_bcr
+    })
+
+tdf = pd.DataFrame(rows).sort_values("Delta BCR", ascending=False)
+
+# pretty table for humans
+def fmt_input(val, kind):
+    if kind == "usd":
+        return f"${val:,.0f}"
+    if kind == "pct":
+        return f"{val:.0%}"
+    if kind == "int":
+        return f"{int(val)}"
+    return f"{val:.2f}"
+
+pretty_rows = []
+kind_map = {v[0]: v[3] for v in specs}
+for _, rrow in tdf.iterrows():
+    k = rrow["Variable"]
+    pretty_rows.append({
+        "Variable": k,
+        "Input Range": f"{fmt_input(rrow['Input Low'], kind_map[k])} → {fmt_input(rrow['Input High'], kind_map[k])}",
+        "BCR Range": f"{rrow['BCR Low']:.2f}× → {rrow['BCR High']:.2f}×",
+    })
+st.write("#### Input and BCR ranges")
+st.dataframe(pd.DataFrame(pretty_rows), use_container_width=True)
+
+# BCR tornado bars
 chart_t = (
-    alt.Chart(tdf)
+    alt.Chart(tdf.assign(VariableLabel=tdf["Variable"].str.replace("_", " ")))
     .mark_bar()
     .encode(
-        x=alt.X("Low:Q", title="BCR"),
-        x2="High:Q",
-        y=alt.Y("Variable:N", sort=tdf["Variable"].tolist()),
-        tooltip=["Variable", alt.Tooltip("Low", format=".2f"), alt.Tooltip("High", format=".2f")]
+        x=alt.X("BCR Low:Q", title="BCR"),
+        x2="BCR High:Q",
+        y=alt.Y("VariableLabel:N", sort=tdf["Variable"].tolist(), title="Variable"),
+        tooltip=[
+            alt.Tooltip("Variable", title="Variable"),
+            alt.Tooltip("Input Low", format=".4f"),
+            alt.Tooltip("Input High", format=".4f"),
+            alt.Tooltip("BCR Low", format=".2f"),
+            alt.Tooltip("BCR High", format=".2f"),
+        ]
     )
     .properties(height=min(40 * len(tdf), 520))
 )
@@ -382,16 +429,19 @@ def mc(params, sims, cv, seed):
         draws.append(compute_roi(p)["bcr"])
     arr = np.array(draws)
     pct = np.percentile(arr, [5, 50, 95])
-    return arr, dict(p5=pct[0], p50=pct[1], p95=pct[2], mean=float(arr.mean()), std=float(arr.std()))
+    frac_ge_100 = float(np.mean(arr >= 100.0))  # fraction with ROI >= 100x
+    return arr, dict(p5=pct[0], p50=pct[1], p95=pct[2], mean=float(arr.mean()), std=float(arr.std()), frac_ge_100=frac_ge_100)
 
 if st.button("Run Monte Carlo"):
     arr, stats = mc(params, sims, cv, seed)
-    c1,c2,c3,c4,c5 = st.columns(5)
+    c1,c2,c3,c4,c5,c6 = st.columns(6)
     c1.metric("P5",  f"{stats['p5']:.1f}×")
     c2.metric("P50", f"{stats['p50']:.1f}×")
     c3.metric("P95", f"{stats['p95']:.1f}×")
     c4.metric("Mean",f"{stats['mean']:.1f}×")
     c5.metric("Std", f"{stats['std']:.2f}")
+    c6.metric("% ≥ 100×", f"{stats['frac_ge_100']*100:.1f}%")
+
     hist_df = pd.DataFrame({"BCR": arr})
     chart_h = (
         alt.Chart(hist_df)
