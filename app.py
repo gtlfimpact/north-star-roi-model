@@ -79,14 +79,15 @@ def extract_with_ai(doc_text: str, api_key: str, model_name: str = "gpt-4o-mini"
         "Task One rules:\n"
         "1) Extract GitLab grant amount requested (USD).\n"
         "2) Overhead rate is 0.097; total cost = grant_amount * 1.097 (you may also return total_project_cost if provided).\n"
-        "3) Breadth: people_reached_total = number of people positively impacted by this project overall.\n"
+        "3) Breadth: people_reached_total = number of people positively impacted by this project overall. "
+        "   The app will later apply GitLab share and completion/outcome.\n"
         "4) completion_rate and positive_outcome_rate if stated; otherwise omit rather than guess.\n"
-        "5) baseline (counterfactual) income and post-program income in USD (convert currencies).\n"
-        "6) duration_years default 30; discount_rate default 0.03.\n"
-        "7) If total project cost is present, derive gitlab_share_pct = grant_amount / total_project_cost.\n"
-        "Do not compute ROI.\n\n"
-        "{ \"values\": { ... }, \"rationales\": { ... } }"
-    )
+        "5) Depth: baseline (counterfactual) annual income and post-program annual income in USD (convert currencies).\n"
+        "6) duration_years default 30 unless clearly less; discount_rate default 0.03.\n"
+        "7) GitLab share of project funding: If the application states a share or a total project budget, derive "
+        "   gitlab_share_pct = grant_amount / total_project_cost. If neither is clear, omit it.\n"
+        "8) Do not compute ROI.\n\n"
+        "JSON shape:\n"
 
     clipped = doc_text[:120000]
     resp = client.chat.completions.create(
@@ -332,96 +333,116 @@ with cvc:
 # ----- Beta/Lognormal helpers -----
 def _beta_from_mean_cv(mean, cv, eps=1e-9):
     """Return alpha,beta for Beta(mean,var) given mean in (0,1) and CV (SD/mean).
-       If infeasible (variance>=mean*(1-mean)), shrink cv until feasible."""
-    m = min(max(mean, eps), 1 - eps)
+       If infeasible (variance >= mean*(1-mean)), shrink CV to be feasible."""
+    m = min(max(float(mean), eps), 1 - eps)
     if cv <= eps:
-        return 1e6*m, 1e6*(1-m)  # near-deterministic
-    var = (cv * m)**2
+        # near-deterministic: very large concentration
+        return 1e6*m, 1e6*(1-m)
+    var = (cv * m) ** 2
     max_var = m * (1 - m) - 1e-9
     if var >= max_var:
         var = max_var
-    k = m*(1-m)/var - 1
-    alpha, beta = m*k, (1-m)*k
+    k = m * (1 - m) / var - 1.0
+    alpha, beta = m * k, (1 - m) * k
     return max(alpha, eps), max(beta, eps)
 
-def _draw_beta(mean, cv, size=1):
-    a,b = _beta_from_mean_cv(mean, cv)
-    return np.random.default_rng().beta(a,b,size=size)
+def draw_scaled_beta_scalar(mean, cap, cv, rng, eps=1e-9):
+    """Mean-preserving scaled Beta in [0, cap]; returns a **float**."""
+    if cv <= 0:
+        return float(mean)
+    cap = float(cap)
+    if cap <= eps:
+        return 0.0
+    mean_frac = min(max(mean / cap, eps), 1 - eps)
+    a, b = _beta_from_mean_cv(mean_frac, cv)
+    y = rng.beta(a, b)          # scalar float
+    return float(y * cap)
 
-def _draw_lognormal_mean_preserving(mean, cv, size=1):
-    """Strictly positive draws with E[X]=mean. If mean==0 or cv==0, return mean."""
+def draw_lognormal_mean_preserving_scalar(mean, cv, rng):
+    """Return a **float** with E[X] = mean for lognormal (if cv > 0), else mean."""
+    mean = float(mean)
     if mean <= 0 or cv <= 0:
-        return np.full(size, mean)
-    sigma2 = math.log(1 + cv**2)
-    sigma = math.sqrt(sigma2)
-    mu = math.log(mean) - 0.5*sigma2
-    return np.random.default_rng().lognormal(mean=mu, sigma=sigma, size=size)
+        return mean
+    sigma2 = math.log(1.0 + cv**2)
+    sigma  = math.sqrt(sigma2)
+    mu     = math.log(mean) - 0.5 * sigma2
+    return float(rng.lognormal(mean=mu, sigma=sigma))  # scalar float
 
 def mc(params, sims, seed,
        cv_share, cv_comp, cv_pos, cv_baseinc, cv_postinc, cv_people, cv_dur, cv_disc, cv_grant, cv_oh,
        hold_cost_fixed=True):
     rng = np.random.default_rng(seed)
 
-    # bounds
     max_overhead = 0.5
     max_discount = 0.2
     dur_lo, dur_hi = 1, 40
-
     draws = np.empty(sims, dtype=float)
 
-    # pre-calc means
+    # Baseline means
     m_share, m_comp, m_pos = params["gitlab_share_pct"], params["completion_rate"], params["positive_outcome_rate"]
     m_base, m_post = params["baseline_income"], params["post_income"]
     m_people = params["people_reached_total"]
     m_dur, m_disc = params["duration_years"], params["discount_rate"]
     m_grant, m_oh = params["grant_amount"], params["overhead_rate"]
 
-    # Scaled-beta for rates with caps (discount, overhead)
-    def draw_scaled_beta(mean, cap, cv):
-        if cap <= 0: return np.array([0.0])
-        mean_frac = min(max(mean / cap, 1e-9), 1-1e-9)
-        a,b = _beta_from_mean_cv(mean_frac, cv)
-        y = rng.beta(a,b)
-        return y * cap
-
     for i in range(sims):
         p = params.copy()
 
-        # Rates in [0,1]
-        p["gitlab_share_pct"]      = float(rng.beta(*_beta_from_mean_cv(m_share, cv_share))) if cv_share>0 else m_share
-        p["completion_rate"]       = float(rng.beta(*_beta_from_mean_cv(m_comp, cv_comp))) if cv_comp>0 else m_comp
-        p["positive_outcome_rate"] = float(rng.beta(*_beta_from_mean_cv(m_pos,  cv_pos  ))) if cv_pos>0  else m_pos
+        # Rates in [0,1] via Beta (scalars)
+        if cv_share > 0:
+            a, b = _beta_from_mean_cv(m_share, cv_share)
+            p["gitlab_share_pct"] = float(rng.beta(a, b))
+        else:
+            p["gitlab_share_pct"] = m_share
 
-        # Discount & overhead as scaled-beta to keep caps/means reasonable
-        p["discount_rate"] = float(draw_scaled_beta(m_disc, max_discount, cv_disc)) if cv_disc>0 else m_disc
+        if cv_comp > 0:
+            a, b = _beta_from_mean_cv(m_comp, cv_comp)
+            p["completion_rate"] = float(rng.beta(a, b))
+        else:
+            p["completion_rate"] = m_comp
+
+        if cv_pos > 0:
+            a, b = _beta_from_mean_cv(m_pos, cv_pos)
+            p["positive_outcome_rate"] = float(rng.beta(a, b))
+        else:
+            p["positive_outcome_rate"] = m_pos
+
+        # Discount & overhead via scaled Beta (keeps caps)
+        p["discount_rate"] = draw_scaled_beta_scalar(m_disc, max_discount, cv_disc, rng) if cv_disc > 0 else m_disc
+
         if hold_cost_fixed:
             p["overhead_rate"] = m_oh
         else:
-            p["overhead_rate"] = float(draw_scaled_beta(m_oh, max_overhead, cv_oh)) if cv_oh>0 else m_oh
+            p["overhead_rate"] = draw_scaled_beta_scalar(m_oh, max_overhead, cv_oh, rng) if cv_oh > 0 else m_oh
 
-        # Positive $ values with lognormal (mean-preserving)
-        p["baseline_income"] = float(_draw_lognormal_mean_preserving(m_base, cv_baseinc)) if cv_baseinc>0 else m_base
-        p["post_income"]     = float(_draw_lognormal_mean_preserving(m_post, cv_postinc)) if cv_postinc>0 else m_post
-        p["people_reached_total"] = int(round(_draw_lognormal_mean_preserving(max(m_people,1.0), cv_people))) if cv_people>0 else m_people
+        # Positive variables via mean-preserving lognormal (scalars)
+        p["baseline_income"] = draw_lognormal_mean_preserving_scalar(m_base, cv_baseinc, rng) if cv_baseinc > 0 else m_base
+        p["post_income"]     = draw_lognormal_mean_preserving_scalar(m_post, cv_postinc, rng) if cv_postinc > 0 else m_post
 
-        # Duration as clipped rounded normal around mean
-        if cv_dur>0:
-            sd_dur = max(m_dur*cv_dur, 1e-9)
+        ppl_draw = draw_lognormal_mean_preserving_scalar(max(m_people, 1.0), cv_people, rng) if cv_people > 0 else m_people
+        p["people_reached_total"] = int(round(max(1.0, ppl_draw)))
+
+        # Duration as clipped rounded normal
+        if cv_dur > 0:
+            sd_dur = max(m_dur * cv_dur, 1e-9)
             p["duration_years"] = int(np.clip(round(rng.normal(m_dur, sd_dur)), dur_lo, dur_hi))
         else:
             p["duration_years"] = m_dur
 
         # Grant amount (cost) — hold fixed if toggled
-        if hold_cost_fixed or cv_grant==0:
+        if hold_cost_fixed or cv_grant == 0:
             p["grant_amount"] = m_grant
         else:
-            p["grant_amount"] = float(_draw_lognormal_mean_preserving(max(m_grant,1.0), cv_grant))
+            p["grant_amount"] = draw_lognormal_mean_preserving_scalar(max(m_grant, 1.0), cv_grant, rng)
 
         draws[i] = compute_roi(p)["bcr"]
 
     pct = np.percentile(draws, [5, 50, 95])
-    stats = dict(p5=pct[0], p50=pct[1], p95=pct[2], mean=float(draws.mean()), std=float(draws.std()),
-                 frac_ge_100=float(np.mean(draws >= 100.0)))
+    stats = dict(
+        p5=pct[0], p50=pct[1], p95=pct[2],
+        mean=float(draws.mean()), std=float(draws.std()),
+        frac_ge_100=float(np.mean(draws >= 100.0))
+    )
     return draws, stats
 
 if st.button("Run Monte Carlo"):
