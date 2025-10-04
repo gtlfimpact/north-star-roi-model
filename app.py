@@ -87,7 +87,7 @@ def extract_with_ai(doc_text: str, api_key: str, model_name: str = "gpt-4o-mini"
         "7) GitLab share of project funding: If the application states a share or a total project budget, derive "
         "   gitlab_share_pct = grant_amount / total_project_cost. If neither is clear, omit it.\n"
         "8) Do not compute ROI.\n\n"
-        "JSON shape:\n"
+        "JSON shape:\n")
 
     clipped = doc_text[:120000]
     resp = client.chat.completions.create(
