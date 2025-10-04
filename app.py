@@ -66,81 +66,235 @@ def compute_roi(params):
         "bcr": bcr,
     }
 
-def extract_with_ai(doc_text: str, api_key: str, model_name: str = "gpt-4o-mini") -> dict | None:
+def extract_with_ai(doc_text: str, api_key: str) -> dict | None:
+    """
+    Returns {"values": {..numbers..}, "rationales": {field: {quote,page,explanation}}}
+    - Page-aware prompting (adds === Page N === blocks)
+    - Strict JSON schema
+    - Regex fallbacks for grant_amount, total_project_cost, people_reached_total
+    - Derives gitlab_share_pct if missing
+    - Defaults: overhead_rate=0.097, duration_years=30, discount_rate=0.03
+    - Auto-fallback to gpt-4o if required fields look thin after gpt-4o-mini
+    """
     from openai import OpenAI
-    import json, re
+    import re, json, math
+
     client = OpenAI(api_key=api_key)
 
-    SYSTEM = (
-        "Analyze the uploaded grant application and return baseline JSON inputs for a Social ROI model.\n"
-        "Return ONLY JSON with two top-level keys: 'values' (numeric inputs) and 'rationales' "
-        "(short explanations with quotes/page cues or formulas). If a value is missing, omit it from 'values' "
-        "but include a brief note in 'rationales'.\n\n"
-        "Task One rules:\n"
-        "1) Extract GitLab grant amount requested (USD).\n"
-        "2) Overhead rate is 0.097; total cost = grant_amount * 1.097 (you may also return total_project_cost if provided).\n"
-        "3) Breadth: people_reached_total = number of people positively impacted by this project overall. "
-        "   The app will later apply GitLab share and completion/outcome.\n"
-        "4) completion_rate and positive_outcome_rate if stated; otherwise omit rather than guess.\n"
-        "5) Depth: baseline (counterfactual) annual income and post-program annual income in USD (convert currencies).\n"
-        "6) duration_years default 30 unless clearly less; discount_rate default 0.03.\n"
-        "7) GitLab share of project funding: If the application states a share or a total project budget, derive "
-        "   gitlab_share_pct = grant_amount / total_project_cost. If neither is clear, omit it.\n"
-        "8) Do not compute ROI.\n\n"
-        "JSON shape:\n")
+    # ---------- helpers ----------
+    def _parse_money(s):
+        if s is None: return None
+        s = s.replace(",", "")
+        m = re.search(r"(-?\d+(?:\.\d+)?)", s)
+        return float(m.group(1)) if m else None
 
-    clipped = doc_text[:120000]
-    resp = client.chat.completions.create(
-        model=model_name,
-        messages=[
-            {"role": "system", "content": SYSTEM},
-            {"role": "user", "content": "Grant application text (truncated):\n" + clipped}
-        ],
-        temperature=0,
-        response_format={"type": "json_object"},
-    )
-    raw = resp.choices[0].message.content or ""
-    try:
-        data = json.loads(raw)
-    except Exception:
-        st.warning("AI prefill returned non-JSON; showing raw output below.")
-        with st.expander("Raw model output"): st.code(raw or "<empty>")
-        m = re.search(r"\{[\s\S]*\}", raw)
-        if not m: return None
-        data = json.loads(m.group(0))
+    def _money_search(text, *phrases):
+        patt_money = r"\$?\s?\d{1,3}(?:[,.\s]\d{3})+(?:\.\d+)?|\$?\s?\d+(?:\.\d+)?"
+        patt = r"(?i)(" + "|".join(re.escape(p) for p in phrases) + r")[^\.:\n]{0,120}?(" + patt_money + r")"
+        m = re.search(patt, text)
+        if not m:  # looser money sweep
+            m = re.search(patt_money, text)
+        return _parse_money(m.group(2) if m and m.lastindex and m.lastindex >= 2 else (m.group(0) if m else None))
 
-    values = data.get("values", {}) or {}
-    rationales = data.get("rationales", {}) or {}
+    def _int_search(text, *near_words):
+        patt_num = r"\b\d{1,4}\b"
+        if near_words:
+            patt = r"(?i)(" + "|".join(re.escape(w) for w in near_words) + r")[^\.:\n]{0,80}?(" + patt_num + r")"
+            m = re.search(patt, text)
+            if m: 
+                try: return int(m.group(2))
+                except: pass
+        m = re.search(patt_num, text)
+        return int(m.group(0)) if m else None
 
-    # Derive share if possible
-    if "gitlab_share_pct" not in values and "grant_amount" in values and "total_project_cost" in values:
-        tpc = float(values["total_project_cost"]) or 0.0
-        gr  = float(values["grant_amount"]) or 0.0
-        if tpc > 0:
-            share = max(0.0, min(1.0, gr / tpc))
+    # Wrap long text into pseudo "pages" (so model can cite a page). If you already
+    # pass real pages elsewhere, this still works – it just chunks ~12–15k chars.
+    def _segment_pages(s, max_chars=15000):
+        s = s.replace("\r", "")
+        if "\f" in s:
+            pieces = [p.strip() for p in s.split("\f") if p.strip()]
+        else:
+            pieces = []
+            cur = []
+            count = 0
+            for para in s.split("\n\n"):
+                cur.append(para)
+                count += len(para) + 2
+                if count > max_chars:
+                    pieces.append("\n\n".join(cur).strip()); cur=[]; count=0
+            if cur: pieces.append("\n\n".join(cur).strip())
+        return [p for p in pieces if p]
+
+    pages = _segment_pages(doc_text)
+    # cap to ~10–12 pages for cost; keep earliest pages which typically contain budgets/cohorts
+    pages = pages[:12]
+
+    def _build_messages():
+        SYSTEM = (
+            "You are building baseline inputs for a Social ROI model from an uploaded grant application.\n"
+            "Return ONLY JSON with two top-level keys:\n"
+            "  - values: numeric fields only (USD or fractions)\n"
+            "  - rationales: for each field found, an object {quote, page, explanation}\n\n"
+            "Rules (Task One):\n"
+            "1) Extract the GitLab grant amount requested (USD). If multiple, take the one explicitly requested from GitLab.\n"
+            "2) Overhead rate is 0.097; total cost = grant_amount * 1.097. If total_project_cost is stated, include it.\n"
+            "3) Breadth: people_reached_total = total people positively impacted by the *project* (not just those served historically). "
+            "   Do NOT apply completion/outcomes here; those are separate fields.\n"
+            "4) completion_rate and positive_outcome_rate if clearly stated for this project/cohort. If unclear, omit (do NOT guess).\n"
+            "5) Depth: baseline (counterfactual) annual income and post-program annual income in USD. Convert currencies.\n"
+            "6) duration_years default 30 unless it clearly states a shorter persistent effect; discount_rate default 0.03.\n"
+            "7) If total project cost or funding mix is given, also include total_project_cost and compute GitLab share as "
+            "   gitlab_share_pct = grant_amount / total_project_cost.\n"
+            "8) Do not compute ROI. Only provide fields and rationales.\n\n"
+            "Field set for values (numbers only):\n"
+            "grant_amount, total_project_cost, overhead_rate, gitlab_share_pct, "
+            "people_reached_total, completion_rate, positive_outcome_rate, "
+            "baseline_income, post_income, duration_years, discount_rate.\n"
+        )
+
+        # Page-labelled user content
+        user_text = []
+        for i, ptxt in enumerate(pages, start=1):
+            user_text.append(f"=== Page {i} ===\n{ptxt}")
+        USER = "Extract values with citations per the rules.\n\n" + "\n\n".join(user_text)
+
+        # Strict schema
+        schema = {
+            "name": "ROI_Baseline_Extraction",
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "values": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "grant_amount": {"type": "number"},
+                            "total_project_cost": {"type": "number"},
+                            "overhead_rate": {"type": "number"},
+                            "gitlab_share_pct": {"type": "number"},
+                            "people_reached_total": {"type": "number"},
+                            "completion_rate": {"type": "number"},
+                            "positive_outcome_rate": {"type": "number"},
+                            "baseline_income": {"type": "number"},
+                            "post_income": {"type": "number"},
+                            "duration_years": {"type": "number"},
+                            "discount_rate": {"type": "number"}
+                        }
+                    },
+                    "rationales": {
+                        "type": "object",
+                        "additionalProperties": {
+                            "type": "object",
+                            "properties": {
+                                "quote": {"type": "string"},
+                                "page":  {"type": "number"},
+                                "explanation": {"type": "string"}
+                            }
+                        }
+                    }
+                },
+                "required": ["values", "rationales"],
+                "additionalProperties": False
+            },
+            "strict": True
+        }
+        return SYSTEM, USER, schema
+
+    def _call(model_name: str):
+        SYSTEM, USER, schema = _build_messages()
+        resp = client.responses.create(
+            model=model_name,               # try 'gpt-4o-mini' first; we fall back below
+            input=[{"role": "system", "content": SYSTEM},
+                   {"role": "user",   "content": USER}],
+            response_format={"type": "json_schema", "json_schema": schema, "strict": True},
+            temperature=0
+        )
+        raw = getattr(resp, "output_text", None)
+        if not raw:
+            try: raw = resp.output[0].content[0].text
+            except Exception: raw = ""
+        try:
+            return json.loads(raw)
+        except Exception:
+            return None
+
+    # 1) primary call (cheap/fast)
+    data = _call("gpt-4o-mini")
+
+    # 2) If missing criticals, escalate to 4o
+    def _missing_crit(d):
+        v = (d or {}).get("values", {}) if isinstance(d, dict) else {}
+        needed_any = any(k in v for k in ("post_income","baseline_income","positive_outcome_rate","grant_amount","people_reached_total"))
+        return (not v) or (not needed_any)
+    if _missing_crit(data):
+        data = _call("gpt-4o")
+
+    # 3) If still None, bail out
+    if not data or "values" not in data:
+        return None
+
+    values = {k: v for k, v in (data.get("values") or {}).items() if isinstance(v, (int, float))}
+    rationales = data.get("rationales") or {}
+
+    # ---------- regex fallbacks (only fill when missing) ----------
+    joined = "\n\n".join(pages)
+
+    # grant amount
+    if "grant_amount" not in values:
+        guess = _money_search(joined,
+                              "request from GitLab", "requested amount", "amount requested",
+                              "GitLab Foundation", "grant request", "grant amount")
+        if guess:
+            values["grant_amount"] = float(guess)
+            rationales.setdefault("grant_amount", {
+                "quote": "Regex fallback", "page": 1, "explanation": "Parsed requested amount from budget/request text."
+            })
+
+    # total project cost
+    if "total_project_cost" not in values:
+        tpc = _money_search(joined, "total project cost", "total project budget", "project budget", "overall budget")
+        if tpc:
+            values["total_project_cost"] = float(tpc)
+            rationales.setdefault("total_project_cost", {
+                "quote": "Regex fallback", "page": 1, "explanation": "Parsed total project cost / overall budget."
+            })
+
+    # people reached
+    if "people_reached_total" not in values:
+        ppl = _int_search(joined, "serve", "students", "participants", "learners", "people")
+        if ppl:
+            values["people_reached_total"] = int(ppl)
+            rationales.setdefault("people_reached_total", {
+                "quote": "Regex fallback", "page": 1, "explanation": "Parsed cohort size / people served."
+            })
+
+    # ---------- derive share if possible ----------
+    if "gitlab_share_pct" not in values:
+        gr = values.get("grant_amount")
+        tpc = values.get("total_project_cost")
+        if gr and tpc and tpc > 0:
+            share = max(0.0, min(1.0, float(gr)/float(tpc)))
             values["gitlab_share_pct"] = share
-            rationales.setdefault("gitlab_share_pct", f"Derived as grant_amount/total_project_cost = {gr:,.0f}/{tpc:,.0f}")
+            rationales.setdefault("gitlab_share_pct", {
+                "quote": f"Derived from grant_amount/total_project_cost = {gr:,.0f}/{tpc:,.0f}",
+                "page": 1, "explanation": "Share of total project budget covered by GitLab request."
+            })
 
-    # Defaults
+    # ---------- defaults ----------
     values.setdefault("overhead_rate", 0.097)
     values.setdefault("duration_years", 30)
     values.setdefault("discount_rate", 0.03)
-    return {"values": values, "rationales": rationales}
 
-# ---------------------- Defaults ------------------
-default_vals = {
-    "grant_amount": 1_000_000.0,
-    "overhead_rate": 0.097,
-    "gitlab_share_pct": 1.0,
-    "people_reached_total": 1000,
-    "completion_rate": 0.8,
-    "positive_outcome_rate": 1.0,
-    "baseline_income": 28000.0,
-    "post_income": 34000.0,
-    "duration_years": 30,
-    "discount_rate": 0.03,
-    "citations": [],
-}
+    # Keep only numeric fields the app understands
+    allowed = {
+        "grant_amount","total_project_cost","overhead_rate","gitlab_share_pct",
+        "people_reached_total","completion_rate","positive_outcome_rate",
+        "baseline_income","post_income","duration_years","discount_rate"
+    }
+    values = {k: float(v) if k != "people_reached_total" else int(v)
+              for k, v in values.items() if k in allowed and isinstance(v, (int, float))}
+
+    return {"values": values, "rationales": rationales}
 
 # ---------------------- Upload --------------------
 uploaded = st.file_uploader("Upload grant application (PDF, DOCX, or TXT)", type=["pdf", "docx", "txt"])
