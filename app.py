@@ -1,3 +1,11 @@
+# app.py — ROI Workbench (Lite) — single-file copy/paste
+# - Upload PDF/DOCX/TXT
+# - Optional AI prefill (OpenAI) with structured JSON
+# - Sliders → ROI metrics
+# - Tornado one-way sensitivity
+# - Monte Carlo simulation
+# - HTML one-pager download (no system deps)
+
 import os, json, base64, datetime
 import streamlit as st
 import altair as alt
@@ -5,32 +13,30 @@ import pandas as pd
 import numpy as np
 import pdfplumber, docx
 
-# --------- Page config ---------
+# ---------------------- Page ----------------------
 st.set_page_config(page_title="ROI Workbench (Lite)", layout="wide")
 st.title("ROI Workbench (Lite)")
 
-# --------- Sidebar: optional AI prefill ---------
+# ---------------------- Sidebar -------------------
 st.sidebar.header("Setup")
 use_ai = st.sidebar.checkbox("Use AI to prefill from document", value=False)
 api_key = st.sidebar.text_input("OpenAI API Key (optional)", type="password") if use_ai else None
 model_name = st.sidebar.selectbox("Model", ["gpt-4o-mini", "gpt-5.0-mini"], index=0) if use_ai else None
 
-# --------- Upload ---------
-uploaded = st.file_uploader("Upload grant application (PDF, DOCX, or TXT)", type=["pdf","docx","txt"])
-
+# ---------------------- Helpers -------------------
 def parse_document_to_text(file):
+    """Extract text from PDF/DOCX/TXT."""
     name = file.name.lower()
     if name.endswith(".pdf"):
         with pdfplumber.open(file) as pdf:
             return "\n\n".join(page.extract_text() or "" for page in pdf.pages)
     if name.endswith(".docx"):
-        doc = docx.Document(file)
-        return "\n".join(p.text for p in doc.paragraphs)
+        d = docx.Document(file)
+        return "\n".join(p.text for p in d.paragraphs)
     return file.read().decode("utf-8", errors="ignore")
 
-# --------- Minimal ROI engine ---------
 def compute_roi(params):
-    # effective participants
+    """Deterministic ROI with half-life decay and discounting."""
     n_eff = params["people_reached_total"] * params["completion_rate"] * params["positive_outcome_rate"]
     uplift = max(params["post_income"] - params["baseline_income"], 0.0)
 
@@ -48,10 +54,77 @@ def compute_roi(params):
         "participants_effectively_served": n_eff,
         "pv_gain_total": pv_total_gain,
         "total_cost": total_cost,
-        "bcr": bcr
+        "bcr": bcr,
     }
 
-# --------- Prefill with AI (optional) ---------
+def extract_with_ai(doc_text: str, api_key: str, model_name: str = "gpt-4o-mini") -> dict | None:
+    """OpenAI Structured Outputs → strict JSON; shows raw output if parsing fails."""
+    from openai import OpenAI
+    import re
+    client = OpenAI(api_key=api_key)
+
+    schema = {
+        "name": "RoiBaselineLite",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "grant_amount": {"type": "number"},
+                "overhead_rate": {"type": "number"},
+                "people_reached_total": {"type": "integer"},
+                "completion_rate": {"type": "number"},
+                "positive_outcome_rate": {"type": "number"},
+                "baseline_income": {"type": "number"},
+                "post_income": {"type": "number"},
+                "half_life_years": {"type": "number"},
+                "duration_years": {"type": "integer"},
+                "discount_rate": {"type": "number"},
+                "attribution": {"type": "number"},
+                "deadweight": {"type": "number"},
+                "citations": {"type": "array", "items": {"type": "string"}}
+            },
+            "required": ["people_reached_total"],
+            "additionalProperties": False
+        }
+    }
+
+    SYSTEM = (
+        "Extract baseline inputs for an ROI model from the document text.\n"
+        "Return ONLY JSON that matches the JSON Schema. If a value is not found, omit it (do not guess).\n"
+        "Prefer cohort counts tied to this grant; apply completion/positive-outcome filters if stated.\n"
+        "Add short quotes/page cues in `citations` for any numbers you extract."
+    )
+
+    clipped = doc_text[:120_000]
+    resp = client.responses.create(
+        model=model_name,
+        input=[{"role": "system", "content": SYSTEM},
+               {"role": "user", "content": clipped}],
+        response_format={"type": "json_schema", "json_schema": schema, "strict": True},
+        temperature=0,
+    )
+
+    raw = None
+    try:
+        raw = resp.output[0].content[0].text
+        return json.loads(raw)
+    except Exception:
+        if raw is None:
+            try:
+                raw = getattr(resp, "output_text", "")
+            except Exception:
+                raw = ""
+        st.warning("AI prefill returned non-JSON; showing raw output below.")
+        with st.expander("Raw model output"):
+            st.code(raw or "<empty>")
+        m = re.search(r"\{[\s\S]*\}", raw or "")
+        if m:
+            try:
+                return json.loads(m.group(0))
+            except Exception:
+                return None
+        return None
+
+# ---------------------- Defaults ------------------
 default_vals = {
     "grant_amount": 1_000_000.0,
     "overhead_rate": 0.097,
@@ -68,44 +141,32 @@ default_vals = {
     "citations": [],
 }
 
+# ---------------------- Upload --------------------
+uploaded = st.file_uploader("Upload grant application (PDF, DOCX, or TXT)", type=["pdf", "docx", "txt"])
+
 if uploaded:
-    text = parse_document_to_text(uploaded)
+    text = parse_document_to_text(uploaded).strip()
 
-    if use_ai and api_key:
-        from openai import OpenAI
-        client = OpenAI(api_key=api_key)
+    with st.expander("Extracted document text (first 5,000 chars)"):
+        st.text_area("text", text[:5000], height=240)
 
-        SYSTEM_PROMPT = (
-            "Extract baseline inputs for an ROI model as strict JSON with keys: "
-            "grant_amount, overhead_rate, people_reached_total, completion_rate, "
-            "positive_outcome_rate, baseline_income, post_income, half_life_years, "
-            "duration_years, discount_rate, attribution, deadweight, citations. "
-            "Defaults: overhead_rate=0.097, duration_years=30, discount_rate=0.03, "
-            "attribution=1.0, deadweight=0.0. All USD. If unknown, guess reasonable values."
-        )
-        try:
-            resp = client.responses.create(
-                model=model_name,
-                input=[
-                    {"role":"system","content":SYSTEM_PROMPT},
-                    {"role":"user","content":text[:100000]}  # avoid very large prompts
-                ]
-            )
-            raw = resp.output[0].content[0].text
-            data = json.loads(raw)
-            # merge into defaults
-            for k in default_vals:
-                if k in data and data[k] is not None:
-                    default_vals[k] = data[k]
-            if "citations" in data:
-                default_vals["citations"] = data["citations"]
-            st.success("AI prefill complete.")
-            with st.expander("AI baseline JSON"):
-                st.json(data)
-        except Exception as e:
-            st.warning(f"AI prefill failed; using defaults. ({e})")
+    if not text:
+        st.warning("Couldn’t extract readable text from the file. Try a text-based PDF or DOCX.")
+    elif use_ai and api_key:
+        ai = extract_with_ai(text, api_key, model_name)
+        if ai:
+            for k, v in ai.items():
+                if k in default_vals and v is not None:
+                    default_vals[k] = v
+            st.success("AI prefill applied from the uploaded document.")
+            with st.expander("AI baseline JSON (applied)"):
+                st.json(ai)
+        else:
+            st.warning("AI prefill failed; using defaults.")
+    elif use_ai and not api_key:
+        st.info("Enter an OpenAI API key to enable AI prefill.")
 
-# --------- Inputs (always editable) ---------
+# ---------------------- Inputs --------------------
 st.subheader("Assumptions")
 col1, col2, col3 = st.columns(3)
 with col1:
@@ -135,19 +196,19 @@ params = dict(
     duration_years=duration, discount_rate=discount, attribution=attribution, deadweight=deadweight,
 )
 
-# --------- Results ---------
+# ---------------------- Results -------------------
 res = compute_roi(params)
-k1,k2,k3,k4 = st.columns(4)
+k1, k2, k3, k4 = st.columns(4)
 k1.metric("BCR", f"{res['bcr']:.1f}×")
 k2.metric("PV Lifetime Gains (Total)", f"${res['pv_gain_total']:,.0f}")
 k3.metric("Participants (effective)", f"{res['participants_effectively_served']:,.0f}")
 k4.metric("Total Cost (incl. OH)", f"${res['total_cost']:,.0f}")
 
-# --------- Chart: Cumulative PV ---------
+# ---------------------- Chart ---------------------
 years = list(range(0, int(params["duration_years"]) + 1))
 decay = np.log(2) / params["half_life_years"]
 uplift = max(params["post_income"] - params["baseline_income"], 0.0)
-stream = [0.0] + [uplift * np.exp(-decay * (t-1)) for t in years[1:]]
+stream = [0.0] + [uplift * np.exp(-decay * (t - 1)) for t in years[1:]]
 disc   = [0.0] + [1 / (1 + params["discount_rate"]) ** t for t in years[1:]]
 annual_pv_per = [s * d for s, d in zip(stream, disc)]
 n_eff = params["people_reached_total"] * params["completion_rate"] * params["positive_outcome_rate"]
@@ -168,9 +229,10 @@ st.altair_chart(chart, use_container_width=True)
 
 st.divider()
 
-# --------- Tornado (one-way) ---------
+# ---------------------- Tornado -------------------
 st.subheader("One-way Sensitivity (Tornado)")
 rng = st.slider("± Range", 0.05, 0.5, 0.2, 0.05)
+
 def run_tornado(p, var, low, high):
     pl = p.copy(); ph = p.copy()
     pl[var] = low; ph[var] = high
@@ -191,10 +253,10 @@ specs = [
 ]
 for var, lo_b, hi_b in specs:
     baseline_val = params[var]
-    lo = max(baseline_val*(1-rng), lo_b if lo_b is not None else -1e18)
-    hi = min(baseline_val*(1+rng), hi_b if hi_b is not None else 1e18)
+    lo = max(baseline_val * (1 - rng), lo_b if lo_b is not None else -1e18)
+    hi = min(baseline_val * (1 + rng), hi_b if hi_b is not None else 1e18)
     l, h = run_tornado(params, var, lo, hi)
-    rows.append({"Variable": var, "Low": min(l,h), "High": max(l,h), "Delta": abs(h-l)})
+    rows.append({"Variable": var, "Low": min(l, h), "High": max(l, h), "Delta": abs(h - l)})
 tdf = pd.DataFrame(rows).sort_values("Delta", ascending=False)
 chart_t = (
     alt.Chart(tdf)
@@ -205,13 +267,13 @@ chart_t = (
         y=alt.Y("Variable:N", sort=tdf["Variable"].tolist()),
         tooltip=["Variable", alt.Tooltip("Low", format=".2f"), alt.Tooltip("High", format=".2f")]
     )
-    .properties(height=min(40*len(tdf), 520))
+    .properties(height=min(40 * len(tdf), 520))
 )
 st.altair_chart(chart_t, use_container_width=True)
 
 st.divider()
 
-# --------- Monte Carlo ---------
+# ---------------------- Monte Carlo ---------------
 st.subheader("Monte Carlo")
 colmc1, colmc2, colmc3 = st.columns(3)
 with colmc1: sims = st.slider("Simulations", 500, 10000, 3000, 500)
@@ -220,7 +282,7 @@ with colmc3: seed = st.number_input("Random seed", value=42, step=1)
 
 def mc(params, sims, cv, seed):
     rng = np.random.default_rng(seed)
-    def clip(v, lo=None, hi=None): 
+    def clip(v, lo=None, hi=None):
         if lo is not None: v = np.maximum(v, lo)
         if hi is not None: v = np.minimum(v, hi)
         return v
@@ -229,10 +291,10 @@ def mc(params, sims, cv, seed):
         p = params.copy()
         for k, lo, hi in specs:
             m = params[k]
-            sd = max(abs(m)*cv, 1e-9)
+            sd = max(abs(m) * cv, 1e-9)
             v = rng.normal(m, sd)
             if k in ("completion_rate","positive_outcome_rate","discount_rate","attribution","deadweight","overhead_rate"):
-                v = float(clip(v, 0.0, 1.0 if k!="discount_rate" else 0.2))
+                v = float(clip(v, 0.0, 1.0 if k != "discount_rate" else 0.2))
             if k == "half_life_years": v = float(clip(v, 1.0, 40.0))
             if k == "duration_years":  v = int(round(clip(v, 1.0, 40.0)))
             if k in ("baseline_income","post_income","grant_amount","people_reached_total"):
@@ -240,7 +302,7 @@ def mc(params, sims, cv, seed):
             p[k] = v
         draws.append(compute_roi(p)["bcr"])
     arr = np.array(draws)
-    pct = np.percentile(arr, [5,50,95])
+    pct = np.percentile(arr, [5, 50, 95])
     return arr, dict(p5=pct[0], p50=pct[1], p95=pct[2], mean=float(arr.mean()), std=float(arr.std()))
 
 if st.button("Run Monte Carlo"):
@@ -262,13 +324,15 @@ if st.button("Run Monte Carlo"):
 
 st.divider()
 
-# --------- One-pager (HTML download) ---------
+# ---------------------- One-pager (HTML) ---------
 st.subheader("One-pager (HTML download)")
 def render_onepager_html(params, res):
     html = f"""
 <!doctype html><html><head><meta charset="utf-8"><title>ROI One-Pager</title>
-<style>body{{font-family:Arial;margin:24px}}.kpi div{{border:1px solid #ddd;padding:10px;border-radius:8px;margin-right:10px;display:inline-block}}</style>
-</head><body>
+<style>
+body{{font-family:Arial;margin:24px}}
+.kpi div{{border:1px solid #ddd;padding:10px;border-radius:8px;margin-right:10px;display:inline-block}}
+</style></head><body>
 <h1>ROI Summary</h1>
 <p><small>{datetime.datetime.now().strftime("%Y-%m-%d %H:%M")}</small></p>
 <div class="kpi">
