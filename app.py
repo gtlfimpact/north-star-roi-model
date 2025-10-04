@@ -1,10 +1,8 @@
-# app.py — ROI Workbench (Lite) — single-file copy/paste
+# app.py — ROI Workbench (Lite, owner-key, constant-uplift)
 # - Upload PDF/DOCX/TXT
-# - Optional AI prefill (OpenAI) with structured JSON
-# - Sliders → ROI metrics
-# - Tornado one-way sensitivity
-# - Monte Carlo simulation
-# - HTML one-pager download (no system deps)
+# - AI prefill via Chat Completions (uses Streamlit secret OPENAI_API_KEY)
+# - Constant annual uplift PV (no half-life, no attribution, no deadweight)
+# - Sliders → ROI metrics, Tornado, Monte Carlo, HTML one-pager
 
 import os, json, base64, datetime
 import streamlit as st
@@ -17,11 +15,22 @@ import pdfplumber, docx
 st.set_page_config(page_title="ROI Workbench (Lite)", layout="wide")
 st.title("ROI Workbench (Lite)")
 
+# ---------------------- OpenAI key (owner-provided) ----------------------
+def _get_openai_key() -> str | None:
+    try:
+        return st.secrets["OPENAI_API_KEY"]
+    except Exception:
+        return os.getenv("OPENAI_API_KEY")
+
+OPENAI_KEY = _get_openai_key()
+if not OPENAI_KEY:
+    st.error("OpenAI key missing. Add OPENAI_API_KEY to Streamlit Secrets or env vars.")
+    st.stop()
+
 # ---------------------- Sidebar -------------------
 st.sidebar.header("Setup")
-use_ai = st.sidebar.checkbox("Use AI to prefill from document", value=False)
-api_key = st.sidebar.text_input("OpenAI API Key (optional)", type="password") if use_ai else None
-model_name = st.sidebar.selectbox("Model", ["gpt-4o-mini", "gpt-5.0-mini"], index=0) if use_ai else None
+use_ai = st.sidebar.checkbox("Use AI to prefill from document", value=True)
+model_name = st.sidebar.selectbox("Model", ["gpt-4o-mini"], index=0, help="Uses your server-side key")
 
 # ---------------------- Helpers -------------------
 def parse_document_to_text(file):
@@ -36,20 +45,28 @@ def parse_document_to_text(file):
     return file.read().decode("utf-8", errors="ignore")
 
 def compute_roi(params):
-    """Deterministic ROI with half-life decay and discounting."""
-    n_eff = params["people_reached_total"] * params["completion_rate"] * params["positive_outcome_rate"]
-    uplift = max(params["post_income"] - params["baseline_income"], 0.0)
+    """
+    Constant annual uplift PV with discounting; no half-life, no deadweight, no attribution.
+    GitLab share gates breadth.
+    """
+    n_eff = (
+        params["people_reached_total"]
+        * params["gitlab_share_pct"]
+        * params["completion_rate"]
+        * params["positive_outcome_rate"]
+    )
 
-    years = np.arange(1, params["duration_years"] + 1)
-    decay = np.log(2) / params["half_life_years"]
-    stream = uplift * np.exp(-decay * (years - 1))
-    pv_stream = (stream / (1 + params["discount_rate"]) ** years).sum()
+    uplift = max(params["post_income"] - params["baseline_income"], 0.0)  # USD per person per year
+    r = float(params["discount_rate"])
+    T = int(params["duration_years"])
+    pv_factor = (1 - (1 + r) ** (-T)) / r if r > 0 else float(T)
 
-    adj = (1 - params["deadweight"]) * params["attribution"]
-    pv_total_gain = n_eff * pv_stream * adj
+    pv_per_person = uplift * pv_factor
+    pv_total_gain = n_eff * pv_per_person
 
-    total_cost = params["grant_amount"] * (1 + params["overhead_rate"])
+    total_cost = params["grant_amount"] * (1 + params["overhead_rate"])  # overhead rule
     bcr = pv_total_gain / max(total_cost, 1e-9)
+
     return {
         "participants_effectively_served": n_eff,
         "pv_gain_total": pv_total_gain,
@@ -57,53 +74,55 @@ def compute_roi(params):
         "bcr": bcr,
     }
 
+# ---------------------- AI extraction -------------------
 def extract_with_ai(doc_text: str, api_key: str, model_name: str = "gpt-4o-mini") -> dict | None:
     """
-    Use Chat Completions + response_format=json_object.
-    Returns a dict or None. Logs raw output if JSON parsing fails.
+    Chat Completions + response_format=json_object (robust on Streamlit Cloud).
+    Returns a dict or None. Shows raw output if parsing fails.
     """
     from openai import OpenAI
     import json, re
 
     client = OpenAI(api_key=api_key)
 
-    schema_text = """
-    Return a single JSON object with these keys (omit any you cannot find):
-      - grant_amount (number, USD)
-      - overhead_rate (number, 0..1)
-      - people_reached_total (integer)
-      - completion_rate (number, 0..1)
-      - positive_outcome_rate (number, 0..1)
-      - baseline_income (number, USD/yr)
-      - post_income (number, USD/yr)
-      - half_life_years (number, 1..40)
-      - duration_years (integer, 1..40)
-      - discount_rate (number, 0..0.2)
-      - attribution (number, 0..1)
-      - deadweight (number, 0..1)
-      - citations (array of short strings)
-    """
-
     SYSTEM = (
-        "Extract baseline inputs for a Social ROI model from the provided document text. "
-        "Use cohort numbers tied to THIS grant (not org totals). If completion/positive outcome "
-        "rates are given, prefer those. Convert all currencies to USD. "
-        "Return ONLY JSON (no prose). " + schema_text
+        "This is a workflow to analyze the user's uploaded grant application and produce baseline JSON "
+        "inputs for a Social ROI model. Work in sequence and return ONLY JSON (no prose).\n\n"
+        "Task One: Acquire the needed JSON inputs for the ROI model\n"
+        "1) Read the application.\n"
+        "2) Extract the GitLab Foundation grant amount requested.\n"
+        "3) Apply a 9.7% overhead: total cost = grant_amount * 1.097 (return overhead_rate=0.097).\n"
+        "4) Breadth: Determine people positively impacted by the funded share. If project serves N and GTLF funds S, "
+        "   use N*S; apply completion/positive-outcome filters to count those who benefit.\n"
+        "5) Depth: Determine baseline (counterfactual) annual income and post-program income in USD (convert currencies).\n"
+        "6) Use 30 years for duration unless clearly fewer; discount rate is 3%.\n"
+        "7) Return ONLY the baseline inputs; do not compute ROI.\n\n"
+        "Return a single JSON object with keys (omit if unknown):\n"
+        "  - grant_amount (number, USD)\n"
+        "  - overhead_rate (number, default 0.097)\n"
+        "  - gitlab_share_pct (number, 0..1)\n"
+        "  - people_reached_total (integer)\n"
+        "  - completion_rate (number, 0..1)\n"
+        "  - positive_outcome_rate (number, 0..1)\n"
+        "  - baseline_income (number, USD/yr)\n"
+        "  - post_income (number, USD/yr)\n"
+        "  - duration_years (integer, default 30)\n"
+        "  - discount_rate (number, default 0.03)\n"
+        "  - citations (array of short strings with quotes/page cues)\n"
+        "Rules: Prefer cohort/period counts tied to this grant. Convert currencies. If uncertain, omit rather than guess."
     )
 
     clipped = doc_text[:120000]
 
-    # --- Chat Completions call (balanced parens) ---
     resp = client.chat.completions.create(
         model=model_name,
         messages=[
             {"role": "system", "content": SYSTEM},
-            {"role": "user", "content": "Document text (truncated):\n" + clipped}
+            {"role": "user", "content": "Grant application text (truncated):\n" + clipped}
         ],
         temperature=0,
-        response_format={"type": "json_object"}
+        response_format={"type": "json_object"},
     )
-    # ----------------------------------------------
 
     raw = resp.choices[0].message.content or ""
     try:
@@ -120,23 +139,18 @@ def extract_with_ai(doc_text: str, api_key: str, model_name: str = "gpt-4o-mini"
                 return None
         return None
 
-
-
-
 # ---------------------- Defaults ------------------
 default_vals = {
     "grant_amount": 1_000_000.0,
     "overhead_rate": 0.097,
+    "gitlab_share_pct": 1.0,
     "people_reached_total": 1000,
     "completion_rate": 0.8,
     "positive_outcome_rate": 1.0,
     "baseline_income": 28000.0,
     "post_income": 34000.0,
-    "half_life_years": 8,
     "duration_years": 30,
     "discount_rate": 0.03,
-    "attribution": 1.0,
-    "deadweight": 0.0,
     "citations": [],
 }
 
@@ -151,48 +165,47 @@ if uploaded:
 
     if not text:
         st.warning("Couldn’t extract readable text from the file. Try a text-based PDF or DOCX.")
-    elif use_ai and api_key:
-        ai = extract_with_ai(text, api_key, model_name)
+    elif use_ai:
+        ai = extract_with_ai(text, OPENAI_KEY, model_name)
         if ai:
             for k, v in ai.items():
                 if k in default_vals and v is not None:
                     default_vals[k] = v
+            if not default_vals.get("overhead_rate"):
+                default_vals["overhead_rate"] = 0.097
             st.success("AI prefill applied from the uploaded document.")
             with st.expander("AI baseline JSON (applied)"):
                 st.json(ai)
         else:
             st.warning("AI prefill failed; using defaults.")
-    elif use_ai and not api_key:
-        st.info("Enter an OpenAI API key to enable AI prefill.")
 
 # ---------------------- Inputs --------------------
 st.subheader("Assumptions")
 col1, col2, col3 = st.columns(3)
 with col1:
     grant_amount = st.number_input("GitLab grant amount (USD)", min_value=0.0, value=float(default_vals["grant_amount"]), step=1000.0)
-    overhead     = st.slider("Overhead rate", 0.0, 0.5, float(default_vals["overhead_rate"]), 0.001)
-    people       = st.number_input("People reached (total)", min_value=0, value=int(default_vals["people_reached_total"]), step=10)
+    overhead     = st.slider("Overhead rate (rule: 9.7%)", 0.0, 0.5, float(default_vals["overhead_rate"]), 0.001)
+    people       = st.number_input("People reached (total project)", min_value=0, value=int(default_vals["people_reached_total"]), step=10)
 with col2:
+    share        = st.slider("GitLab share of project funding", 0.0, 1.0, float(default_vals["gitlab_share_pct"]), 0.01)
     completion   = st.slider("Completion rate", 0.0, 1.0, float(default_vals["completion_rate"]), 0.01)
     positive     = st.slider("Positive outcome rate", 0.0, 1.0, float(default_vals["positive_outcome_rate"]), 0.01)
-    baseline_inc = st.number_input("Baseline income ($/yr)", min_value=0.0, value=float(default_vals["baseline_income"]), step=500.0)
 with col3:
+    baseline_inc = st.number_input("Baseline income ($/yr)", min_value=0.0, value=float(default_vals["baseline_income"]), step=500.0)
     post_inc     = st.number_input("Post-program income ($/yr)", min_value=0.0, value=float(default_vals["post_income"]), step=500.0)
-    half_life    = st.slider("Uplift half-life (yrs)", 1, 40, int(default_vals["half_life_years"]))
-    duration     = st.slider("Duration (yrs)", 1, 40, int(default_vals["duration_years"]))
-row = st.columns(3)
+
+row = st.columns(2)
 with row[0]:
-    discount     = st.slider("Real discount rate", 0.0, 0.2, float(default_vals["discount_rate"]), 0.005)
+    duration     = st.slider("Duration (yrs)", 1, 40, int(default_vals["duration_years"]))
 with row[1]:
-    attribution  = st.slider("Attribution", 0.0, 1.0, float(default_vals["attribution"]), 0.05)
-with row[2]:
-    deadweight   = st.slider("Deadweight", 0.0, 1.0, float(default_vals["deadweight"]), 0.05)
+    discount     = st.slider("Real discount rate", 0.0, 0.2, float(default_vals["discount_rate"]), 0.005)
 
 params = dict(
     grant_amount=grant_amount, overhead_rate=overhead,
+    gitlab_share_pct=share,
     people_reached_total=people, completion_rate=completion, positive_outcome_rate=positive,
-    baseline_income=baseline_inc, post_income=post_inc, half_life_years=half_life,
-    duration_years=duration, discount_rate=discount, attribution=attribution, deadweight=deadweight,
+    baseline_income=baseline_inc, post_income=post_inc,
+    duration_years=duration, discount_rate=discount,
 )
 
 # ---------------------- Results -------------------
@@ -204,15 +217,16 @@ k3.metric("Participants (effective)", f"{res['participants_effectively_served']:
 k4.metric("Total Cost (incl. OH)", f"${res['total_cost']:,.0f}")
 
 # ---------------------- Chart ---------------------
-years = list(range(0, int(params["duration_years"]) + 1))
-decay = np.log(2) / params["half_life_years"]
+years = np.arange(0, int(params["duration_years"]) + 1)
+r = float(params["discount_rate"])
+T = int(params["duration_years"])
 uplift = max(params["post_income"] - params["baseline_income"], 0.0)
-stream = [0.0] + [uplift * np.exp(-decay * (t - 1)) for t in years[1:]]
-disc   = [0.0] + [1 / (1 + params["discount_rate"]) ** t for t in years[1:]]
-annual_pv_per = [s * d for s, d in zip(stream, disc)]
-n_eff = params["people_reached_total"] * params["completion_rate"] * params["positive_outcome_rate"]
-annual_pv_total = [x * n_eff * (1 - params["deadweight"]) * params["attribution"] for x in annual_pv_per]
-cum_pv = np.cumsum([0.0] + annual_pv_total[1:])
+
+pv_factor_per_year = np.array([0.0] + [1 / (1 + r) ** t for t in range(1, T + 1)])
+ppl_eff = params["people_reached_total"] * params["gitlab_share_pct"] * params["completion_rate"] * params["positive_outcome_rate"]
+annual_pv_total = pv_factor_per_year * uplift * ppl_eff
+cum_pv = np.cumsum(annual_pv_total)
+
 df = pd.DataFrame({"Year": years, "Cumulative PV Gains ($)": cum_pv})
 chart = (
     alt.Chart(df)
@@ -239,15 +253,13 @@ def run_tornado(p, var, low, high):
 
 rows = []
 specs = [
+    ("gitlab_share_pct", 0.0, 1.0),
     ("completion_rate", 0.0, 1.0),
     ("positive_outcome_rate", 0.0, 1.0),
     ("baseline_income", 0.0, None),
     ("post_income", 0.0, None),
-    ("half_life_years", 1.0, 40.0),
     ("duration_years", 1.0, 40.0),
     ("discount_rate", 0.0, 0.2),
-    ("attribution", 0.0, 1.0),
-    ("deadweight", 0.0, 1.0),
     ("overhead_rate", 0.0, 0.5),
 ]
 for var, lo_b, hi_b in specs:
@@ -276,7 +288,7 @@ st.divider()
 st.subheader("Monte Carlo")
 colmc1, colmc2, colmc3 = st.columns(3)
 with colmc1: sims = st.slider("Simulations", 500, 10000, 3000, 500)
-with colmc2: cv   = st.slider("Coef. of variation", 0.02, 0.5, 0.1, 0.01)
+with colmc2: cv   = st.slider("Coef. of variation (SD as % of mean)", 0.02, 0.5, 0.1, 0.01)
 with colmc3: seed = st.number_input("Random seed", value=42, step=1)
 
 def mc(params, sims, cv, seed):
@@ -286,15 +298,26 @@ def mc(params, sims, cv, seed):
         if hi is not None: v = np.minimum(v, hi)
         return v
     draws = []
+    specs_local = [
+        ("gitlab_share_pct", 0.0, 1.0),
+        ("completion_rate", 0.0, 1.0),
+        ("positive_outcome_rate", 0.0, 1.0),
+        ("baseline_income", 0.0, None),
+        ("post_income", 0.0, None),
+        ("duration_years", 1.0, 40.0),
+        ("discount_rate", 0.0, 0.2),
+        ("overhead_rate", 0.0, 0.5),
+        ("grant_amount", 0.0, None),
+        ("people_reached_total", 0.0, None),
+    ]
     for _ in range(sims):
         p = params.copy()
-        for k, lo, hi in specs:
+        for k, lo, hi in specs_local:
             m = params[k]
             sd = max(abs(m) * cv, 1e-9)
             v = rng.normal(m, sd)
-            if k in ("completion_rate","positive_outcome_rate","discount_rate","attribution","deadweight","overhead_rate"):
+            if k in ("gitlab_share_pct","completion_rate","positive_outcome_rate","discount_rate","overhead_rate"):
                 v = float(clip(v, 0.0, 1.0 if k != "discount_rate" else 0.2))
-            if k == "half_life_years": v = float(clip(v, 1.0, 40.0))
             if k == "duration_years":  v = int(round(clip(v, 1.0, 40.0)))
             if k in ("baseline_income","post_income","grant_amount","people_reached_total"):
                 v = float(max(v, 0.0))
@@ -342,11 +365,11 @@ body{{font-family:Arial;margin:24px}}
 </div>
 <h2>Assumptions</h2>
 <ul>
-  <li>People reached: {params['people_reached_total']:,}</li>
+  <li>People reached (project): {params['people_reached_total']:,}</li>
+  <li>GitLab share: {params['gitlab_share_pct']:.0%}</li>
   <li>Completion: {params['completion_rate']:.0%}; Positive outcome: {params['positive_outcome_rate']:.0%}</li>
   <li>Baseline: ${params['baseline_income']:,.0f}; Post: ${params['post_income']:,.0f}</li>
-  <li>Half-life: {params['half_life_years']} yrs; Duration: {params['duration_years']} yrs</li>
-  <li>Discount: {params['discount_rate']:.1%}; Attribution: {params['attribution']:.0%}; Deadweight: {params['deadweight']:.0%}</li>
+  <li>Duration: {params['duration_years']} yrs; Discount: {params['discount_rate']:.1%}</li>
   <li>Grant: ${params['grant_amount']:,.0f}; Overhead: {params['overhead_rate']:.1%}</li>
 </ul>
 </body></html>
