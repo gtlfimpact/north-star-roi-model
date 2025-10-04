@@ -1,6 +1,7 @@
 streamlit
-pandas
 altair
-PyPDF2
+pandas
+numpy
+pdfplumber
 python-docx
-openai>=0.27.0
+openai>=1.40.0
