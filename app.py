@@ -1,10 +1,11 @@
-# app.py — ROI Workbench (Lite, with AI rationales + Tornado input ranges + MC %>=100x)
-# - Uses Streamlit secret OPENAI_API_KEY (owner key)
-# - AI prefill returns values + rationales; computes gitlab_share_pct if needed
-# - Constant annual uplift PV (no half-life, attribution, deadweight)
-# - Sliders, Tornado (shows input + BCR ranges), Monte Carlo (adds %>=100x), HTML one-pager
+# app.py — ROI Workbench (Lite) with:
+# - AI prefill (owner key via Streamlit secrets)
+# - Sliders + Reasoning table
+# - Tornado with input + BCR ranges
+# - Monte Carlo: per-variable CVs, Beta/Lognormal draws (mean-preserving), "Hold cost fixed"
+# - HTML one-pager
 
-import os, json, base64, datetime
+import os, json, base64, datetime, math
 import streamlit as st
 import altair as alt
 import pandas as pd
@@ -44,27 +45,20 @@ def parse_document_to_text(file):
     return file.read().decode("utf-8", errors="ignore")
 
 def compute_roi(params):
-    """
-    Constant annual uplift PV with discounting; GitLab share gates breadth.
-    """
     n_eff = (
         params["people_reached_total"]
         * params["gitlab_share_pct"]
         * params["completion_rate"]
         * params["positive_outcome_rate"]
     )
-
-    uplift = max(params["post_income"] - params["baseline_income"], 0.0)  # USD per person per year
+    uplift = max(params["post_income"] - params["baseline_income"], 0.0)
     r = float(params["discount_rate"])
     T = int(params["duration_years"])
     pv_factor = (1 - (1 + r) ** (-T)) / r if r > 0 else float(T)
-
     pv_per_person = uplift * pv_factor
     pv_total_gain = n_eff * pv_per_person
-
     total_cost = params["grant_amount"] * (1 + params["overhead_rate"])
     bcr = pv_total_gain / max(total_cost, 1e-9)
-
     return {
         "participants_effectively_served": n_eff,
         "pv_gain_total": pv_total_gain,
@@ -72,19 +66,9 @@ def compute_roi(params):
         "bcr": bcr,
     }
 
-# ---------------------- AI extraction (values + rationales) -------------------
 def extract_with_ai(doc_text: str, api_key: str, model_name: str = "gpt-4o-mini") -> dict | None:
-    """
-    Returns:
-    {
-      "values": {... numeric inputs ...},
-      "rationales": {key: short explanation},
-    }
-    Optionally includes values.total_project_cost; we derive gitlab_share_pct when possible.
-    """
     from openai import OpenAI
     import json, re
-
     client = OpenAI(api_key=api_key)
 
     SYSTEM = (
@@ -95,36 +79,16 @@ def extract_with_ai(doc_text: str, api_key: str, model_name: str = "gpt-4o-mini"
         "Task One rules:\n"
         "1) Extract GitLab grant amount requested (USD).\n"
         "2) Overhead rate is 0.097; total cost = grant_amount * 1.097 (you may also return total_project_cost if provided).\n"
-        "3) Breadth: people_reached_total = number of people positively impacted by this project overall. "
-        "   The app will later apply GitLab share and completion/outcome.\n"
+        "3) Breadth: people_reached_total = number of people positively impacted by this project overall.\n"
         "4) completion_rate and positive_outcome_rate if stated; otherwise omit rather than guess.\n"
-        "5) Depth: baseline (counterfactual) annual income and post-program annual income in USD (convert currencies).\n"
-        "6) duration_years default 30 unless clearly less; discount_rate default 0.03.\n"
-        "7) GitLab share of project funding: If the application states a share or a total project budget, derive "
-        "   gitlab_share_pct = grant_amount / total_project_cost. If neither is clear, omit it.\n"
-        "8) Do not compute ROI.\n\n"
-        "JSON shape:\n"
-        "{\n"
-        "  \"values\": {\n"
-        "    \"grant_amount\": number,\n"
-        "    \"overhead_rate\": number,\n"
-        "    \"gitlab_share_pct\": number,\n"
-        "    \"people_reached_total\": integer,\n"
-        "    \"completion_rate\": number,\n"
-        "    \"positive_outcome_rate\": number,\n"
-        "    \"baseline_income\": number,\n"
-        "    \"post_income\": number,\n"
-        "    \"duration_years\": integer,\n"
-        "    \"discount_rate\": number,\n"
-        "    \"total_project_cost\": number\n"
-        "  },\n"
-        "  \"rationales\": { key: string }\n"
-        "}\n"
-        "Keep rationales ≤200 chars; include page cues or a formula when derived."
+        "5) baseline (counterfactual) income and post-program income in USD (convert currencies).\n"
+        "6) duration_years default 30; discount_rate default 0.03.\n"
+        "7) If total project cost is present, derive gitlab_share_pct = grant_amount / total_project_cost.\n"
+        "Do not compute ROI.\n\n"
+        "{ \"values\": { ... }, \"rationales\": { ... } }"
     )
 
     clipped = doc_text[:120000]
-
     resp = client.chat.completions.create(
         model=model_name,
         messages=[
@@ -134,39 +98,32 @@ def extract_with_ai(doc_text: str, api_key: str, model_name: str = "gpt-4o-mini"
         temperature=0,
         response_format={"type": "json_object"},
     )
-
     raw = resp.choices[0].message.content or ""
     try:
         data = json.loads(raw)
     except Exception:
         st.warning("AI prefill returned non-JSON; showing raw output below.")
-        with st.expander("Raw model output"):
-            st.code(raw or "<empty>")
+        with st.expander("Raw model output"): st.code(raw or "<empty>")
         m = re.search(r"\{[\s\S]*\}", raw)
-        if not m:
-            return None
+        if not m: return None
         data = json.loads(m.group(0))
 
     values = data.get("values", {}) or {}
     rationales = data.get("rationales", {}) or {}
 
-    # Fallback: derive gitlab_share_pct if grant + total_project_cost present
+    # Derive share if possible
     if "gitlab_share_pct" not in values and "grant_amount" in values and "total_project_cost" in values:
         tpc = float(values["total_project_cost"]) or 0.0
         gr  = float(values["grant_amount"]) or 0.0
         if tpc > 0:
             share = max(0.0, min(1.0, gr / tpc))
             values["gitlab_share_pct"] = share
-            rationales.setdefault(
-                "gitlab_share_pct",
-                f"Derived as grant_amount / total_project_cost = {gr:,.0f} / {tpc:,.0f}"
-            )
+            rationales.setdefault("gitlab_share_pct", f"Derived as grant_amount/total_project_cost = {gr:,.0f}/{tpc:,.0f}")
 
     # Defaults
     values.setdefault("overhead_rate", 0.097)
     values.setdefault("duration_years", 30)
     values.setdefault("discount_rate", 0.03)
-
     return {"values": values, "rationales": rationales}
 
 # ---------------------- Defaults ------------------
@@ -186,16 +143,11 @@ default_vals = {
 
 # ---------------------- Upload --------------------
 uploaded = st.file_uploader("Upload grant application (PDF, DOCX, or TXT)", type=["pdf", "docx", "txt"])
-
 if uploaded:
     text = parse_document_to_text(uploaded).strip()
-
     with st.expander("Extracted document text (first 5,000 chars)"):
         st.text_area("text", text[:5000], height=240)
-
-    if not text:
-        st.warning("Couldn’t extract readable text from the file. Try a text-based PDF or DOCX.")
-    elif use_ai:
+    if text and use_ai:
         ai = extract_with_ai(text, OPENAI_KEY, model_name)
         if ai:
             vals = ai.get("values", {})
@@ -205,8 +157,7 @@ if uploaded:
                     default_vals[k] = v
             st.session_state["ai_rationales"] = reasons
             st.success("AI prefill applied from the uploaded document.")
-            with st.expander("AI values (applied)"):
-                st.json(vals)
+            with st.expander("AI values (applied)"): st.json(vals)
         else:
             st.warning("AI prefill failed; using defaults.")
 
@@ -260,9 +211,7 @@ if reason_map:
         "duration_years": int(params["duration_years"]),
         "discount_rate": float(params["discount_rate"]),
     }
-    rows = []
-    for k in keys_in_ui:
-        rows.append({"Field": k, "Value used": current_vals.get(k, ""), "Reasoning": reason_map.get(k, "—")})
+    rows = [{"Field": k, "Value used": current_vals.get(k, ""), "Reasoning": reason_map.get(k, "—")} for k in keys_in_ui]
     st.dataframe(pd.DataFrame(rows), use_container_width=True)
 
 # ---------------------- Results -------------------
@@ -278,28 +227,22 @@ years = np.arange(0, int(params["duration_years"]) + 1)
 r = float(params["discount_rate"])
 T = int(params["duration_years"])
 uplift = max(params["post_income"] - params["baseline_income"], 0.0)
-
 pv_factor_per_year = np.array([0.0] + [1 / (1 + r) ** t for t in range(1, T + 1)])
 ppl_eff = params["people_reached_total"] * params["gitlab_share_pct"] * params["completion_rate"] * params["positive_outcome_rate"]
 annual_pv_total = pv_factor_per_year * uplift * ppl_eff
 cum_pv = np.cumsum(annual_pv_total)
-
 df = pd.DataFrame({"Year": years, "Cumulative PV Gains ($)": cum_pv})
 chart = (
-    alt.Chart(df)
-    .mark_line(point=True)
-    .encode(
+    alt.Chart(df).mark_line(point=True).encode(
         x=alt.X("Year:O"),
         y=alt.Y("Cumulative PV Gains ($):Q", title="PV ($)"),
         tooltip=["Year", alt.Tooltip("Cumulative PV Gains ($):Q", format="$,.0f")]
-    )
-    .properties(height=320)
+    ).properties(height=320)
 )
 st.altair_chart(chart, use_container_width=True)
-
 st.divider()
 
-# ---------------------- Tornado (shows input + BCR ranges) -------------------
+# ---------------------- Tornado (input + BCR ranges) -------------------
 st.subheader("One-way Sensitivity (Tornado)")
 rng = st.slider("± Range", 0.05, 0.5, 0.2, 0.05)
 
@@ -308,7 +251,6 @@ def run_tornado(p, var, low, high):
     pl[var] = low; ph[var] = high
     return (compute_roi(pl)["bcr"], compute_roi(ph)["bcr"])
 
-# variable specs with bounds for inputs
 specs = [
     ("gitlab_share_pct", 0.0, 1.0, "pct"),
     ("completion_rate", 0.0, 1.0, "pct"),
@@ -319,121 +261,175 @@ specs = [
     ("discount_rate", 0.0, 0.2, "pct"),
     ("overhead_rate", 0.0, 0.5, "pct"),
 ]
-
 rows = []
 for var, lo_b, hi_b, kind in specs:
     baseline_val = params[var]
     lo_in = max(baseline_val * (1 - rng), lo_b if lo_b is not None else -1e18)
     hi_in = min(baseline_val * (1 + rng), hi_b if hi_b is not None else 1e18)
-
-    # cast bounds for ints
     if kind == "int":
         lo_in = int(round(lo_in)); hi_in = int(round(hi_in))
-
     bcr_lo, bcr_hi = run_tornado(params, var, lo_in, hi_in)
     lo_bcr, hi_bcr = (min(bcr_lo, bcr_hi), max(bcr_lo, bcr_hi))
-
-    rows.append({
-        "Variable": var,
-        "Input Low": lo_in,
-        "Input High": hi_in,
-        "BCR Low": lo_bcr,
-        "BCR High": hi_bcr,
-        "Delta BCR": hi_bcr - lo_bcr
-    })
-
+    rows.append({"Variable": var, "Input Low": lo_in, "Input High": hi_in, "BCR Low": lo_bcr, "BCR High": hi_bcr, "Delta BCR": hi_bcr - lo_bcr})
 tdf = pd.DataFrame(rows).sort_values("Delta BCR", ascending=False)
 
-# pretty table for humans
 def fmt_input(val, kind):
-    if kind == "usd":
-        return f"${val:,.0f}"
-    if kind == "pct":
-        return f"{val:.0%}"
-    if kind == "int":
-        return f"{int(val)}"
+    if kind == "usd": return f"${val:,.0f}"
+    if kind == "pct": return f"{val:.0%}"
+    if kind == "int": return f"{int(val)}"
     return f"{val:.2f}"
 
-pretty_rows = []
-kind_map = {v[0]: v[3] for v in specs}
+pretty_rows, kind_map = [], {v[0]: v[3] for v in specs}
 for _, rrow in tdf.iterrows():
     k = rrow["Variable"]
-    pretty_rows.append({
-        "Variable": k,
-        "Input Range": f"{fmt_input(rrow['Input Low'], kind_map[k])} → {fmt_input(rrow['Input High'], kind_map[k])}",
-        "BCR Range": f"{rrow['BCR Low']:.2f}× → {rrow['BCR High']:.2f}×",
-    })
+    pretty_rows.append({"Variable": k, "Input Range": f"{fmt_input(rrow['Input Low'], kind_map[k])} → {fmt_input(rrow['Input High'], kind_map[k])}",
+                        "BCR Range": f"{rrow['BCR Low']:.2f}× → {rrow['BCR High']:.2f}×"})
 st.write("#### Input and BCR ranges")
 st.dataframe(pd.DataFrame(pretty_rows), use_container_width=True)
 
-# BCR tornado bars
 chart_t = (
-    alt.Chart(tdf.assign(VariableLabel=tdf["Variable"].str.replace("_", " ")))
-    .mark_bar()
-    .encode(
+    alt.Chart(tdf.assign(VariableLabel=tdf["Variable"].str.replace("_", " "))).mark_bar().encode(
         x=alt.X("BCR Low:Q", title="BCR"),
         x2="BCR High:Q",
         y=alt.Y("VariableLabel:N", sort=tdf["Variable"].tolist(), title="Variable"),
-        tooltip=[
-            alt.Tooltip("Variable", title="Variable"),
-            alt.Tooltip("Input Low", format=".4f"),
-            alt.Tooltip("Input High", format=".4f"),
-            alt.Tooltip("BCR Low", format=".2f"),
-            alt.Tooltip("BCR High", format=".2f"),
-        ]
-    )
-    .properties(height=min(40 * len(tdf), 520))
+        tooltip=[alt.Tooltip("Variable", title="Variable"),
+                 alt.Tooltip("Input Low", format=".4f"),
+                 alt.Tooltip("Input High", format=".4f"),
+                 alt.Tooltip("BCR Low", format=".2f"),
+                 alt.Tooltip("BCR High", format=".2f")]
+    ).properties(height=min(40 * len(tdf), 520))
 )
 st.altair_chart(chart_t, use_container_width=True)
-
 st.divider()
 
-# ---------------------- Monte Carlo ---------------
+# ---------------------- Monte Carlo (per-var CVs, Beta/Lognormal, hold-cost) ---------------
 st.subheader("Monte Carlo")
-colmc1, colmc2, colmc3 = st.columns(3)
-with colmc1: sims = st.slider("Simulations", 500, 10000, 3000, 500)
-with colmc2: cv   = st.slider("Coef. of variation (SD as % of mean)", 0.02, 0.5, 0.1, 0.01)
-with colmc3: seed = st.number_input("Random seed", value=42, step=1)
 
-def mc(params, sims, cv, seed):
+# ----- CV UI -----
+st.markdown("**Uncertainty (Coefficient of Variation, SD as % of mean)**")
+colcv0, colcv1, colcv2, colcv3 = st.columns(4)
+with colcv0: sims = st.slider("Simulations", 500, 15000, 3000, 500)
+with colcv1: seed = st.number_input("Random seed", value=42, step=1)
+with colcv2: hold_cost_fixed = st.checkbox("Hold cost fixed in Monte Carlo", value=True)
+with colcv3: base_cv = st.slider("Global starting CV", 0.02, 0.5, 0.15, 0.01, help="Seed value for the per-variable CV sliders")
+
+st.write("Adjust CV per variable (higher = more uncertain):")
+cva, cvb, cvc = st.columns(3)
+with cva:
+    cv_share   = st.slider("CV: GitLab share", 0.0, 0.8, base_cv, 0.01)
+    cv_comp    = st.slider("CV: Completion rate", 0.0, 0.8, base_cv, 0.01)
+    cv_pos     = st.slider("CV: Positive outcome rate", 0.0, 0.8, base_cv, 0.01)
+with cvb:
+    cv_baseinc = st.slider("CV: Baseline income", 0.0, 0.8, min(0.30, base_cv+0.05), 0.01)
+    cv_postinc = st.slider("CV: Post income", 0.0, 0.8, min(0.30, base_cv+0.05), 0.01)
+    cv_people  = st.slider("CV: People reached", 0.0, 0.8, min(0.20, base_cv), 0.01)
+with cvc:
+    cv_dur     = st.slider("CV: Duration (yrs)", 0.0, 0.5, 0.0, 0.01)
+    cv_disc    = st.slider("CV: Discount rate", 0.0, 0.5, 0.05, 0.01)
+    cv_grant   = st.slider("CV: Grant amount", 0.0, 0.5, 0.0 if hold_cost_fixed else 0.05, 0.01)
+    cv_oh      = st.slider("CV: Overhead rate", 0.0, 0.5, 0.0 if hold_cost_fixed else 0.05, 0.01)
+
+# ----- Beta/Lognormal helpers -----
+def _beta_from_mean_cv(mean, cv, eps=1e-9):
+    """Return alpha,beta for Beta(mean,var) given mean in (0,1) and CV (SD/mean).
+       If infeasible (variance>=mean*(1-mean)), shrink cv until feasible."""
+    m = min(max(mean, eps), 1 - eps)
+    if cv <= eps:
+        return 1e6*m, 1e6*(1-m)  # near-deterministic
+    var = (cv * m)**2
+    max_var = m * (1 - m) - 1e-9
+    if var >= max_var:
+        var = max_var
+    k = m*(1-m)/var - 1
+    alpha, beta = m*k, (1-m)*k
+    return max(alpha, eps), max(beta, eps)
+
+def _draw_beta(mean, cv, size=1):
+    a,b = _beta_from_mean_cv(mean, cv)
+    return np.random.default_rng().beta(a,b,size=size)
+
+def _draw_lognormal_mean_preserving(mean, cv, size=1):
+    """Strictly positive draws with E[X]=mean. If mean==0 or cv==0, return mean."""
+    if mean <= 0 or cv <= 0:
+        return np.full(size, mean)
+    sigma2 = math.log(1 + cv**2)
+    sigma = math.sqrt(sigma2)
+    mu = math.log(mean) - 0.5*sigma2
+    return np.random.default_rng().lognormal(mean=mu, sigma=sigma, size=size)
+
+def mc(params, sims, seed,
+       cv_share, cv_comp, cv_pos, cv_baseinc, cv_postinc, cv_people, cv_dur, cv_disc, cv_grant, cv_oh,
+       hold_cost_fixed=True):
     rng = np.random.default_rng(seed)
-    def clip(v, lo=None, hi=None):
-        if lo is not None: v = np.maximum(v, lo)
-        if hi is not None: v = np.minimum(v, hi)
-        return v
-    draws = []
-    specs_local = [
-        ("gitlab_share_pct", 0.0, 1.0),
-        ("completion_rate", 0.0, 1.0),
-        ("positive_outcome_rate", 0.0, 1.0),
-        ("baseline_income", 0.0, None),
-        ("post_income", 0.0, None),
-        ("duration_years", 1.0, 40.0),
-        ("discount_rate", 0.0, 0.2),
-        ("overhead_rate", 0.0, 0.5),
-        ("grant_amount", 0.0, None),
-        ("people_reached_total", 0.0, None),
-    ]
-    for _ in range(sims):
+
+    # bounds
+    max_overhead = 0.5
+    max_discount = 0.2
+    dur_lo, dur_hi = 1, 40
+
+    draws = np.empty(sims, dtype=float)
+
+    # pre-calc means
+    m_share, m_comp, m_pos = params["gitlab_share_pct"], params["completion_rate"], params["positive_outcome_rate"]
+    m_base, m_post = params["baseline_income"], params["post_income"]
+    m_people = params["people_reached_total"]
+    m_dur, m_disc = params["duration_years"], params["discount_rate"]
+    m_grant, m_oh = params["grant_amount"], params["overhead_rate"]
+
+    # Scaled-beta for rates with caps (discount, overhead)
+    def draw_scaled_beta(mean, cap, cv):
+        if cap <= 0: return np.array([0.0])
+        mean_frac = min(max(mean / cap, 1e-9), 1-1e-9)
+        a,b = _beta_from_mean_cv(mean_frac, cv)
+        y = rng.beta(a,b)
+        return y * cap
+
+    for i in range(sims):
         p = params.copy()
-        for k, lo, hi in specs_local:
-            m = params[k]
-            sd = max(abs(m) * cv, 1e-9)
-            v = rng.normal(m, sd)
-            if k in ("gitlab_share_pct","completion_rate","positive_outcome_rate","discount_rate","overhead_rate"):
-                v = float(clip(v, 0.0, 1.0 if k != "discount_rate" else 0.2))
-            if k == "duration_years":  v = int(round(clip(v, 1.0, 40.0)))
-            if k in ("baseline_income","post_income","grant_amount","people_reached_total"):
-                v = float(max(v, 0.0))
-            p[k] = v
-        draws.append(compute_roi(p)["bcr"])
-    arr = np.array(draws)
-    pct = np.percentile(arr, [5, 50, 95])
-    frac_ge_100 = float(np.mean(arr >= 100.0))  # fraction with ROI >= 100x
-    return arr, dict(p5=pct[0], p50=pct[1], p95=pct[2], mean=float(arr.mean()), std=float(arr.std()), frac_ge_100=frac_ge_100)
+
+        # Rates in [0,1]
+        p["gitlab_share_pct"]      = float(rng.beta(*_beta_from_mean_cv(m_share, cv_share))) if cv_share>0 else m_share
+        p["completion_rate"]       = float(rng.beta(*_beta_from_mean_cv(m_comp, cv_comp))) if cv_comp>0 else m_comp
+        p["positive_outcome_rate"] = float(rng.beta(*_beta_from_mean_cv(m_pos,  cv_pos  ))) if cv_pos>0  else m_pos
+
+        # Discount & overhead as scaled-beta to keep caps/means reasonable
+        p["discount_rate"] = float(draw_scaled_beta(m_disc, max_discount, cv_disc)) if cv_disc>0 else m_disc
+        if hold_cost_fixed:
+            p["overhead_rate"] = m_oh
+        else:
+            p["overhead_rate"] = float(draw_scaled_beta(m_oh, max_overhead, cv_oh)) if cv_oh>0 else m_oh
+
+        # Positive $ values with lognormal (mean-preserving)
+        p["baseline_income"] = float(_draw_lognormal_mean_preserving(m_base, cv_baseinc)) if cv_baseinc>0 else m_base
+        p["post_income"]     = float(_draw_lognormal_mean_preserving(m_post, cv_postinc)) if cv_postinc>0 else m_post
+        p["people_reached_total"] = int(round(_draw_lognormal_mean_preserving(max(m_people,1.0), cv_people))) if cv_people>0 else m_people
+
+        # Duration as clipped rounded normal around mean
+        if cv_dur>0:
+            sd_dur = max(m_dur*cv_dur, 1e-9)
+            p["duration_years"] = int(np.clip(round(rng.normal(m_dur, sd_dur)), dur_lo, dur_hi))
+        else:
+            p["duration_years"] = m_dur
+
+        # Grant amount (cost) — hold fixed if toggled
+        if hold_cost_fixed or cv_grant==0:
+            p["grant_amount"] = m_grant
+        else:
+            p["grant_amount"] = float(_draw_lognormal_mean_preserving(max(m_grant,1.0), cv_grant))
+
+        draws[i] = compute_roi(p)["bcr"]
+
+    pct = np.percentile(draws, [5, 50, 95])
+    stats = dict(p5=pct[0], p50=pct[1], p95=pct[2], mean=float(draws.mean()), std=float(draws.std()),
+                 frac_ge_100=float(np.mean(draws >= 100.0)))
+    return draws, stats
 
 if st.button("Run Monte Carlo"):
-    arr, stats = mc(params, sims, cv, seed)
+    arr, stats = mc(
+        params, sims, seed,
+        cv_share, cv_comp, cv_pos, cv_baseinc, cv_postinc, cv_people, cv_dur, cv_disc, cv_grant, cv_oh,
+        hold_cost_fixed=hold_cost_fixed
+    )
     c1,c2,c3,c4,c5,c6 = st.columns(6)
     c1.metric("P5",  f"{stats['p5']:.1f}×")
     c2.metric("P50", f"{stats['p50']:.1f}×")
@@ -444,10 +440,9 @@ if st.button("Run Monte Carlo"):
 
     hist_df = pd.DataFrame({"BCR": arr})
     chart_h = (
-        alt.Chart(hist_df)
-        .mark_bar()
-        .encode(x=alt.X("BCR:Q", bin=alt.Bin(maxbins=40)), y="count()")
-        .properties(height=300)
+        alt.Chart(hist_df).mark_bar().encode(
+            x=alt.X("BCR:Q", bin=alt.Bin(maxbins=40)), y="count()"
+        ).properties(height=300)
     )
     st.altair_chart(chart_h, use_container_width=True)
 
@@ -458,10 +453,8 @@ st.subheader("One-pager (HTML download)")
 def render_onepager_html(params, res):
     html = f"""
 <!doctype html><html><head><meta charset="utf-8"><title>ROI One-Pager</title>
-<style>
-body{{font-family:Arial;margin:24px}}
-.kpi div{{border:1px solid #ddd;padding:10px;border-radius:8px;margin-right:10px;display:inline-block}}
-</style></head><body>
+<style>body{{font-family:Arial;margin:24px}}
+.kpi div{{border:1px solid #ddd;padding:10px;border-radius:8px;margin-right:10px;display:inline-block}}</style></head><body>
 <h1>ROI Summary</h1>
 <p><small>{datetime.datetime.now().strftime("%Y-%m-%d %H:%M")}</small></p>
 <div class="kpi">
