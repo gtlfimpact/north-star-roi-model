@@ -58,11 +58,13 @@ def compute_roi(params):
     }
 
 def extract_with_ai(doc_text: str, api_key: str, model_name: str = "gpt-4o-mini") -> dict | None:
-    """OpenAI Structured Outputs → strict JSON; shows raw output if parsing fails."""
+    """OpenAI Structured Outputs → strict JSON; logs raw output if parsing fails."""
     from openai import OpenAI
-    import re
+    import re, json
+
     client = OpenAI(api_key=api_key)
 
+    # JSON Schema for structured output
     schema = {
         "name": "RoiBaselineLite",
         "schema": {
@@ -84,7 +86,9 @@ def extract_with_ai(doc_text: str, api_key: str, model_name: str = "gpt-4o-mini"
             },
             "required": ["people_reached_total"],
             "additionalProperties": False
-        }
+        },
+        # IMPORTANT: strict belongs *inside* json_schema
+        "strict": True
     }
 
     SYSTEM = (
@@ -95,27 +99,33 @@ def extract_with_ai(doc_text: str, api_key: str, model_name: str = "gpt-4o-mini"
     )
 
     clipped = doc_text[:120_000]
+    prompt = f"{SYSTEM}\n\n=== DOCUMENT TEXT (truncated) ===\n{clipped}"
+
+    # Use a single string for `input`; this avoids message-shape TypeErrors
     resp = client.responses.create(
         model=model_name,
-        input=[{"role": "system", "content": SYSTEM},
-               {"role": "user", "content": clipped}],
-        response_format={"type": "json_schema", "json_schema": schema, "strict": True},
+        input=prompt,
+        response_format={"type": "json_schema", "json_schema": schema},
         temperature=0,
     )
 
-    raw = None
+    # Prefer the convenience field; fall back if missing
+    raw = getattr(resp, "output_text", None)
+    if not raw:
+        try:
+            raw = resp.output[0].content[0].text
+        except Exception:
+            raw = ""
+
+    # Try strict JSON parse
     try:
-        raw = resp.output[0].content[0].text
         return json.loads(raw)
     except Exception:
-        if raw is None:
-            try:
-                raw = getattr(resp, "output_text", "")
-            except Exception:
-                raw = ""
         st.warning("AI prefill returned non-JSON; showing raw output below.")
         with st.expander("Raw model output"):
             st.code(raw or "<empty>")
+
+        # Last-resort: extract first {...} block
         m = re.search(r"\{[\s\S]*\}", raw or "")
         if m:
             try:
@@ -123,6 +133,7 @@ def extract_with_ai(doc_text: str, api_key: str, model_name: str = "gpt-4o-mini"
             except Exception:
                 return None
         return None
+
 
 # ---------------------- Defaults ------------------
 default_vals = {
