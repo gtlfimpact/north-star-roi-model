@@ -296,23 +296,51 @@ def extract_with_ai(doc_text: str, api_key: str) -> dict | None:
 
     return {"values": values, "rationales": rationales}
 
+# ---------------------- Defaults (must exist before UI) ----------------------
+DEFAULTS = {
+    "grant_amount": 1_000_000.0,
+    "overhead_rate": 0.097,
+    "gitlab_share_pct": 1.0,
+    "people_reached_total": 1000,
+    "completion_rate": 0.8,
+    "positive_outcome_rate": 1.0,
+    "baseline_income": 28000.0,
+    "post_income": 34000.0,
+    "duration_years": 30,
+    "discount_rate": 0.03,
+}
+
+# Persist defaults across Streamlit reruns
+if "default_vals" not in st.session_state:
+    st.session_state.default_vals = DEFAULTS.copy()
+
+default_vals = st.session_state.default_vals  # <-- SAFE to use in the UI below
+
+
 # ---------------------- Upload --------------------
 uploaded = st.file_uploader("Upload grant application (PDF, DOCX, or TXT)", type=["pdf", "docx", "txt"])
 if uploaded:
     text = parse_document_to_text(uploaded).strip()
     with st.expander("Extracted document text (first 5,000 chars)"):
         st.text_area("text", text[:5000], height=240)
+
     if text and use_ai:
-        ai = extract_with_ai(text, OPENAI_KEY, model_name)
+        # NOTE: extract_with_ai accepts (doc_text, api_key) in your current code
+        ai = extract_with_ai(text, OPENAI_KEY)
         if ai:
-            vals = ai.get("values", {})
-            reasons = ai.get("rationales", {})
+            vals = ai.get("values", {}) or {}
+            reasons = ai.get("rationales", {}) or {}
+
+            # Merge AI values into defaults and persist to session
             for k, v in vals.items():
                 if k in default_vals and v is not None:
                     default_vals[k] = v
-            st.session_state["ai_rationales"] = reasons
+            st.session_state.default_vals = default_vals  # persist
+            st.session_state.ai_rationales = reasons      # persist
+
             st.success("AI prefill applied from the uploaded document.")
-            with st.expander("AI values (applied)"): st.json(vals)
+            with st.expander("AI values (applied)"):
+                st.json(vals)
         else:
             st.warning("AI prefill failed; using defaults.")
 
