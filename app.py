@@ -1,8 +1,8 @@
-# app.py — ROI Workbench (Lite, owner-key, constant-uplift)
-# - Upload PDF/DOCX/TXT
-# - AI prefill via Chat Completions (uses Streamlit secret OPENAI_API_KEY)
-# - Constant annual uplift PV (no half-life, no attribution, no deadweight)
-# - Sliders → ROI metrics, Tornado, Monte Carlo, HTML one-pager
+# app.py — ROI Workbench (Lite, with AI rationales)
+# - Uses Streamlit secret OPENAI_API_KEY (owner key)
+# - AI prefill returns values + rationales; computes gitlab_share_pct if needed
+# - Constant annual uplift PV (no half-life, attribution, deadweight)
+# - Sliders, Tornado, Monte Carlo, HTML one-pager
 
 import os, json, base64, datetime
 import streamlit as st
@@ -15,7 +15,7 @@ import pdfplumber, docx
 st.set_page_config(page_title="ROI Workbench (Lite)", layout="wide")
 st.title("ROI Workbench (Lite)")
 
-# ---------------------- OpenAI key (owner-provided) ----------------------
+# ---------------------- Owner OpenAI key ----------------------
 def _get_openai_key() -> str | None:
     try:
         return st.secrets["OPENAI_API_KEY"]
@@ -30,11 +30,10 @@ if not OPENAI_KEY:
 # ---------------------- Sidebar -------------------
 st.sidebar.header("Setup")
 use_ai = st.sidebar.checkbox("Use AI to prefill from document", value=True)
-model_name = st.sidebar.selectbox("Model", ["gpt-4o-mini"], index=0, help="Uses your server-side key")
+model_name = st.sidebar.selectbox("Model", ["gpt-4o-mini"], index=0, help="Runs with your server-side key")
 
 # ---------------------- Helpers -------------------
 def parse_document_to_text(file):
-    """Extract text from PDF/DOCX/TXT."""
     name = file.name.lower()
     if name.endswith(".pdf"):
         with pdfplumber.open(file) as pdf:
@@ -46,8 +45,7 @@ def parse_document_to_text(file):
 
 def compute_roi(params):
     """
-    Constant annual uplift PV with discounting; no half-life, no deadweight, no attribution.
-    GitLab share gates breadth.
+    Constant annual uplift PV with discounting; GitLab share gates breadth.
     """
     n_eff = (
         params["people_reached_total"]
@@ -64,7 +62,7 @@ def compute_roi(params):
     pv_per_person = uplift * pv_factor
     pv_total_gain = n_eff * pv_per_person
 
-    total_cost = params["grant_amount"] * (1 + params["overhead_rate"])  # overhead rule
+    total_cost = params["grant_amount"] * (1 + params["overhead_rate"])
     bcr = pv_total_gain / max(total_cost, 1e-9)
 
     return {
@@ -74,11 +72,15 @@ def compute_roi(params):
         "bcr": bcr,
     }
 
-# ---------------------- AI extraction -------------------
+# ---------------------- AI extraction (values + rationales) -------------------
 def extract_with_ai(doc_text: str, api_key: str, model_name: str = "gpt-4o-mini") -> dict | None:
     """
-    Chat Completions + response_format=json_object (robust on Streamlit Cloud).
-    Returns a dict or None. Shows raw output if parsing fails.
+    Returns:
+    {
+      "values": {... numeric inputs ...},
+      "rationales": {key: short explanation},
+    }
+    Optionally includes values.total_project_cost; we derive gitlab_share_pct when possible.
     """
     from openai import OpenAI
     import json, re
@@ -86,30 +88,39 @@ def extract_with_ai(doc_text: str, api_key: str, model_name: str = "gpt-4o-mini"
     client = OpenAI(api_key=api_key)
 
     SYSTEM = (
-        "This is a workflow to analyze the user's uploaded grant application and produce baseline JSON "
-        "inputs for a Social ROI model. Work in sequence and return ONLY JSON (no prose).\n\n"
-        "Task One: Acquire the needed JSON inputs for the ROI model\n"
-        "1) Read the application.\n"
-        "2) Extract the GitLab Foundation grant amount requested.\n"
-        "3) Apply a 9.7% overhead: total cost = grant_amount * 1.097 (return overhead_rate=0.097).\n"
-        "4) Breadth: Determine people positively impacted by the funded share. If project serves N and GTLF funds S, "
-        "   use N*S; apply completion/positive-outcome filters to count those who benefit.\n"
-        "5) Depth: Determine baseline (counterfactual) annual income and post-program income in USD (convert currencies).\n"
-        "6) Use 30 years for duration unless clearly fewer; discount rate is 3%.\n"
-        "7) Return ONLY the baseline inputs; do not compute ROI.\n\n"
-        "Return a single JSON object with keys (omit if unknown):\n"
-        "  - grant_amount (number, USD)\n"
-        "  - overhead_rate (number, default 0.097)\n"
-        "  - gitlab_share_pct (number, 0..1)\n"
-        "  - people_reached_total (integer)\n"
-        "  - completion_rate (number, 0..1)\n"
-        "  - positive_outcome_rate (number, 0..1)\n"
-        "  - baseline_income (number, USD/yr)\n"
-        "  - post_income (number, USD/yr)\n"
-        "  - duration_years (integer, default 30)\n"
-        "  - discount_rate (number, default 0.03)\n"
-        "  - citations (array of short strings with quotes/page cues)\n"
-        "Rules: Prefer cohort/period counts tied to this grant. Convert currencies. If uncertain, omit rather than guess."
+        "Analyze the uploaded grant application and return baseline JSON inputs for a Social ROI model.\n"
+        "Return ONLY JSON with two top-level keys: 'values' (numeric inputs) and 'rationales' "
+        "(short explanations with quotes/page cues or formulas). If a value is missing, omit it from 'values' "
+        "but include a brief note in 'rationales'.\n\n"
+        "Task One rules:\n"
+        "1) Extract GitLab grant amount requested (USD).\n"
+        "2) Overhead rate is 0.097; total cost = grant_amount * 1.097 (you may also return total_project_cost if provided).\n"
+        "3) Breadth: people_reached_total = number of people positively impacted by this project overall. "
+        "   The app will later apply GitLab share and completion/outcome.\n"
+        "4) completion_rate and positive_outcome_rate if stated; otherwise omit rather than guess.\n"
+        "5) Depth: baseline (counterfactual) annual income and post-program annual income in USD (convert currencies).\n"
+        "6) duration_years default 30 unless clearly less; discount_rate default 0.03.\n"
+        "7) GitLab share of project funding: If the application states a share or a total project budget, derive "
+        "   gitlab_share_pct = grant_amount / total_project_cost. If neither is clear, omit it.\n"
+        "8) Do not compute ROI.\n\n"
+        "JSON shape:\n"
+        "{\n"
+        "  \"values\": {\n"
+        "    \"grant_amount\": number,\n"
+        "    \"overhead_rate\": number,\n"
+        "    \"gitlab_share_pct\": number,\n"
+        "    \"people_reached_total\": integer,\n"
+        "    \"completion_rate\": number,\n"
+        "    \"positive_outcome_rate\": number,\n"
+        "    \"baseline_income\": number,\n"
+        "    \"post_income\": number,\n"
+        "    \"duration_years\": integer,\n"
+        "    \"discount_rate\": number,\n"
+        "    \"total_project_cost\": number\n"
+        "  },\n"
+        "  \"rationales\": { key: string }\n"
+        "}\n"
+        "Keep rationales ≤200 chars; include page cues or a formula when derived."
     )
 
     clipped = doc_text[:120000]
@@ -126,18 +137,37 @@ def extract_with_ai(doc_text: str, api_key: str, model_name: str = "gpt-4o-mini"
 
     raw = resp.choices[0].message.content or ""
     try:
-        return json.loads(raw)
+        data = json.loads(raw)
     except Exception:
         st.warning("AI prefill returned non-JSON; showing raw output below.")
         with st.expander("Raw model output"):
             st.code(raw or "<empty>")
         m = re.search(r"\{[\s\S]*\}", raw)
-        if m:
-            try:
-                return json.loads(m.group(0))
-            except Exception:
-                return None
-        return None
+        if not m:
+            return None
+        data = json.loads(m.group(0))
+
+    values = data.get("values", {}) or {}
+    rationales = data.get("rationales", {}) or {}
+
+    # Fallback: derive gitlab_share_pct if grant + total_project_cost present
+    if "gitlab_share_pct" not in values and "grant_amount" in values and "total_project_cost" in values:
+        tpc = float(values["total_project_cost"]) or 0.0
+        gr  = float(values["grant_amount"]) or 0.0
+        if tpc > 0:
+            share = max(0.0, min(1.0, gr / tpc))
+            values["gitlab_share_pct"] = share
+            rationales.setdefault(
+                "gitlab_share_pct",
+                f"Derived as grant_amount / total_project_cost = {gr:,.0f} / {tpc:,.0f}"
+            )
+
+    # Defaults
+    values.setdefault("overhead_rate", 0.097)
+    values.setdefault("duration_years", 30)
+    values.setdefault("discount_rate", 0.03)
+
+    return {"values": values, "rationales": rationales}
 
 # ---------------------- Defaults ------------------
 default_vals = {
@@ -168,14 +198,15 @@ if uploaded:
     elif use_ai:
         ai = extract_with_ai(text, OPENAI_KEY, model_name)
         if ai:
-            for k, v in ai.items():
+            vals = ai.get("values", {})
+            reasons = ai.get("rationales", {})
+            for k, v in vals.items():
                 if k in default_vals and v is not None:
                     default_vals[k] = v
-            if not default_vals.get("overhead_rate"):
-                default_vals["overhead_rate"] = 0.097
+            st.session_state["ai_rationales"] = reasons
             st.success("AI prefill applied from the uploaded document.")
-            with st.expander("AI baseline JSON (applied)"):
-                st.json(ai)
+            with st.expander("AI values (applied)"):
+                st.json(vals)
         else:
             st.warning("AI prefill failed; using defaults.")
 
@@ -207,6 +238,32 @@ params = dict(
     baseline_income=baseline_inc, post_income=post_inc,
     duration_years=duration, discount_rate=discount,
 )
+
+# ---------------------- Reasoning table -------------------
+reason_map = st.session_state.get("ai_rationales", {}) if "ai_rationales" in st.session_state else {}
+if reason_map:
+    st.markdown("### Why these values?")
+    keys_in_ui = [
+        "grant_amount","overhead_rate","gitlab_share_pct","people_reached_total",
+        "completion_rate","positive_outcome_rate","baseline_income","post_income",
+        "duration_years","discount_rate"
+    ]
+    current_vals = {
+        "grant_amount": float(params["grant_amount"]),
+        "overhead_rate": float(params["overhead_rate"]),
+        "gitlab_share_pct": float(params["gitlab_share_pct"]),
+        "people_reached_total": int(params["people_reached_total"]),
+        "completion_rate": float(params["completion_rate"]),
+        "positive_outcome_rate": float(params["positive_outcome_rate"]),
+        "baseline_income": float(params["baseline_income"]),
+        "post_income": float(params["post_income"]),
+        "duration_years": int(params["duration_years"]),
+        "discount_rate": float(params["discount_rate"]),
+    }
+    rows = []
+    for k in keys_in_ui:
+        rows.append({"Field": k, "Value used": current_vals.get(k, ""), "Reasoning": reason_map.get(k, "—")})
+    st.dataframe(pd.DataFrame(rows), use_container_width=True)
 
 # ---------------------- Results -------------------
 res = compute_roi(params)
