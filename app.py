@@ -58,81 +58,69 @@ def compute_roi(params):
     }
 
 def extract_with_ai(doc_text: str, api_key: str, model_name: str = "gpt-4o-mini") -> dict | None:
-    """OpenAI Structured Outputs → strict JSON; logs raw output if parsing fails."""
+    """
+    Use Chat Completions + response_format=json_object.
+    Returns a dict or None. Logs raw output if JSON parsing fails.
+    """
     from openai import OpenAI
-    import re, json
+    import json, re
 
     client = OpenAI(api_key=api_key)
 
-    # JSON Schema for structured output
-    schema = {
-        "name": "RoiBaselineLite",
-        "schema": {
-            "type": "object",
-            "properties": {
-                "grant_amount": {"type": "number"},
-                "overhead_rate": {"type": "number"},
-                "people_reached_total": {"type": "integer"},
-                "completion_rate": {"type": "number"},
-                "positive_outcome_rate": {"type": "number"},
-                "baseline_income": {"type": "number"},
-                "post_income": {"type": "number"},
-                "half_life_years": {"type": "number"},
-                "duration_years": {"type": "integer"},
-                "discount_rate": {"type": "number"},
-                "attribution": {"type": "number"},
-                "deadweight": {"type": "number"},
-                "citations": {"type": "array", "items": {"type": "string"}}
-            },
-            "required": ["people_reached_total"],
-            "additionalProperties": False
-        },
-        # IMPORTANT: strict belongs *inside* json_schema
-        "strict": True
-    }
+    schema_text = """
+    Return a single JSON object with these keys (omit any you cannot find):
+      - grant_amount (number, USD)
+      - overhead_rate (number, 0..1)
+      - people_reached_total (integer)
+      - completion_rate (number, 0..1)
+      - positive_outcome_rate (number, 0..1)
+      - baseline_income (number, USD/yr)
+      - post_income (number, USD/yr)
+      - half_life_years (number, 1..40)
+      - duration_years (integer, 1..40)
+      - discount_rate (number, 0..0.2)
+      - attribution (number, 0..1)
+      - deadweight (number, 0..1)
+      - citations (array of short strings)
+    """
 
     SYSTEM = (
-        "Extract baseline inputs for an ROI model from the document text.\n"
-        "Return ONLY JSON that matches the JSON Schema. If a value is not found, omit it (do not guess).\n"
-        "Prefer cohort counts tied to this grant; apply completion/positive-outcome filters if stated.\n"
-        "Add short quotes/page cues in `citations` for any numbers you extract."
+        "Extract baseline inputs for a Social ROI model from the provided document text. "
+        "Use cohort numbers tied to THIS grant (not org totals). If completion/positive outcome "
+        "rates are given, prefer those. Convert all currencies to USD. "
+        "Return ONLY JSON (no prose). " + schema_text
     )
 
-    clipped = doc_text[:120_000]
-    prompt = f"{SYSTEM}\n\n=== DOCUMENT TEXT (truncated) ===\n{clipped}"
+    clipped = doc_text[:120000]
 
-    # Use a single string for `input`; this avoids message-shape TypeErrors
-    resp = client.responses.create(
+    # --- Chat Completions call (balanced parens) ---
+    resp = client.chat.completions.create(
         model=model_name,
-        input=prompt,
-        response_format={"type": "json_schema", "json_schema": schema},
+        messages=[
+            {"role": "system", "content": SYSTEM},
+            {"role": "user", "content": "Document text (truncated):\n" + clipped}
+        ],
         temperature=0,
+        response_format={"type": "json_object"}
     )
+    # ----------------------------------------------
 
-    # Prefer the convenience field; fall back if missing
-    raw = getattr(resp, "output_text", None)
-    if not raw:
-        try:
-            raw = resp.output[0].content[0].text
-        except Exception:
-            raw = ""
-
-    # Try strict JSON parse
+    raw = resp.choices[0].message.content or ""
     try:
         return json.loads(raw)
     except Exception:
         st.warning("AI prefill returned non-JSON; showing raw output below.")
         with st.expander("Raw model output"):
             st.code(raw or "<empty>")
-
-        # Last-resort: extract first {...} block
-        m = re.search(r"\{[\s\S]*\}", raw or "")
+        m = re.search(r"\{[\s\S]*\}", raw)
         if m:
             try:
                 return json.loads(m.group(0))
             except Exception:
                 return None
         return None
+
+
 
 
 # ---------------------- Defaults ------------------
